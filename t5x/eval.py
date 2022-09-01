@@ -59,8 +59,10 @@ def evaluate(
     restore_checkpoint_cfg: utils.RestoreCheckpointConfig,
     partitioner: partitioning.BasePartitioner,
     output_dir: str,
-    inference_evaluator_cls: Type[seqio.Evaluator] = seqio.Evaluator,
+    inference_evaluator_cls: utils.EvaluatorConstructor = seqio.Evaluator,
     summarize_config_fn: SummarizeConfigFn = gin_utils.summarize_gin_config,
+    train_state_initializer_cls: Type[
+        utils.TrainStateInitializer] = utils.TrainStateInitializer,
     fallback_init_rng: Optional[int] = None):
   """Evaluation function.
 
@@ -76,6 +78,8 @@ def evaluate(
     summarize_config_fn: A function that takes in the model directory, an
       optional SummaryWriter, and the step number, and writes a summary of the
       configuration. SummaryWriter will be None in most cases.
+    train_state_initializer_cls: t5x.utils.TrainStateInitializer class
+      for initializing partitioned TrainState from checkpoints or scratch.
     fallback_init_rng: A random seed used for parameter initialization during
       model re-loading when utils.RestoreCheckpointConfig.fallback_to_scratch is
       set to True. If None, parameter initialization is not allowed during model
@@ -85,6 +89,9 @@ def evaluate(
   if dataset_cfg.module:
     utils.import_module(dataset_cfg.module)
   batch_size = dataset_cfg.batch_size
+
+  # TODO(b/234480674): GDA not supported for eval.
+  restore_checkpoint_cfg.use_gda = False
 
   summarize_config_fn(model_dir=output_dir, summary_writer=None, step=0)
 
@@ -108,7 +115,8 @@ def evaluate(
       use_cached=dataset_cfg.use_cached,
       seed=dataset_cfg.seed,
       sequence_length=dataset_cfg.task_feature_lengths,
-      log_dir=os.path.join(output_dir, 'inference_eval'))
+      log_dir=os.path.join(output_dir, 'inference_eval'),
+      use_memory_cache=dataset_cfg.use_memory_cache)
   if not evaluator.eval_tasks:
     raise ValueError(
         f"'{dataset_cfg.mixture_or_task_name}' has no metrics for evaluation.")
@@ -122,7 +130,7 @@ def evaluate(
       k: (batch_size,) + s for k, s in evaluator.model_feature_shapes.items()
   }
 
-  train_state_initializer = utils.TrainStateInitializer(
+  train_state_initializer = train_state_initializer_cls(
       optimizer_def=None,  # Do not load optimizer state.
       init_fn=model.get_initial_variables,
       input_shapes=input_shapes,
@@ -170,9 +178,10 @@ def evaluate(
     # ----------------------------------------------------------------------------
 
     # Run final evaluation (with decoding) on the full eval dataset.
+    host_step = int(utils.get_local_data(train_state.step))
     all_metrics, _, _ = evaluator.evaluate(
         compute_metrics=jax.process_index() == 0,
-        step=int(train_state.step),
+        step=host_step,
         predict_fn=functools.partial(
             predict_fn, train_state=train_state, rng=jax.random.PRNGKey(0)),
         score_fn=functools.partial(score_fn, train_state=train_state),
@@ -182,7 +191,7 @@ def evaluate(
             rng=jax.random.PRNGKey(0)))
     all_metrics.result()  # Ensure metrics are finished being computed.
     # Wait until computations are done before continuing.
-    multihost_utils.sync_global_devices(f'step_{train_state.step}:complete')
+    multihost_utils.sync_global_devices(f'step_{host_step}:complete')
 
   logging.info('Finished.')
 

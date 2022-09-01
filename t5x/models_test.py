@@ -328,8 +328,10 @@ class EncoderDecoderModelTest(parameterized.TestCase):
     # `max_decode_length` calls to our tokens -> logits func.
     self.assertLen(tokens_to_logits_mock.call_args_list, max_decode_len)
     for tokens_call in tokens_to_logits_mock.call_args_list:
-      # Inputs: [B * Be, 1]
-      inputs, cache = tokens_call[0]
+      decoding_state: decoding.DecodingState = tokens_call[0][0]
+      # Inputs: [B, 1]
+      inputs = decoding_state.cur_token
+      cache = decoding_state.cache
       cache = flax.core.unfreeze(cache)
       # Cache: [B * Be, 1] * #Layers
       cache_keys = [
@@ -469,7 +471,8 @@ class EncoderDecoderModelTest(parameterized.TestCase):
         'decoder_target_tokens': decoder_target_tokens
     }
 
-    partitioner = partitioning.PjitPartitioner(num_partitions=1)
+    partitioner = partitioning.PjitPartitioner(
+        num_partitions=1, use_cpu_pjit=True)
 
     model = test_utils.get_t5_test_model()
 

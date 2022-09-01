@@ -2,7 +2,7 @@
 
 
 [Gin](https://github.com/google/gin-config/blob/main/README.md) is a lightweight configuration framework for Python,
-based on dependency injection. While P5X does not employ gin in its core
+based on dependency injection. While T5X does not employ gin in its core
 libraries, it is used to configure runs of the `train`, `eval`, and `infer`
 scripts. This usage is a bit different (and more limited) than how gin is
 typically applied, so this primer should be useful even for those who may be
@@ -185,7 +185,7 @@ binding these constructors.
 ```py
 # Load model with overrides.
 include 't5x/examples/t5/t5_1_1/large.gin'
-models.EncoderDecoderModel.predict_batch_with_aux.beam_size = 2
+models.EncoderDecoderModel.predict_batch_with_aux.num_decodes = 1
 ```
 
 Although we could define `MODEL = model.EncoderDecoderModel()` here, we prefer

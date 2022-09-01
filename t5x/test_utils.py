@@ -22,12 +22,14 @@ from typing import Generator, List, Sequence, Tuple
 import unittest
 
 import jax
+from jax.experimental.global_device_array import GlobalDeviceArray
 from jax.experimental.maps import Mesh
 import numpy as np
 import seqio
 from t5x import adafactor
 from t5x import models
 from t5x import train_state as train_state_lib
+from t5x.checkpoint_importer import LazyArray
 from t5x.examples.t5 import network
 import tensorflow.compat.v2 as tf
 
@@ -73,7 +75,7 @@ def coords_to_idx(coords: Tuple[int, ...], bounds: Tuple[int, ...]) -> int:
   # Calculate stride multipliers.
   strides = tuple(itertools.accumulate((1,) + bounds[:-1], operator.mul))
   # Sum linear index from strides and coords
-  return sum(jax.tree_multimap(lambda x, y: x * y, coords, strides))
+  return sum(jax.tree_map(lambda x, y: x * y, coords, strides))
 
 
 def make_devices(nx: int,
@@ -85,11 +87,11 @@ def make_devices(nx: int,
   """Create mock TPU devices."""
   devices = []
   device_bounds = (nx, ny, nz, nc)
-  hnx, hny, hnz, hnc = jax.tree_multimap(lambda a, b: a // b, device_bounds,
-                                         host_layout)
+  hnx, hny, hnz, hnc = jax.tree_map(lambda a, b: a // b, device_bounds,
+                                    host_layout)
   for x, y, z, c in itertools.product(*map(range, device_bounds)):
-    hx, hy, hz, hc = jax.tree_multimap(lambda a, b: a // b, (x, y, z, c),
-                                       host_layout)
+    hx, hy, hz, hc = jax.tree_map(lambda a, b: a // b, (x, y, z, c),
+                                  host_layout)
     # TODO(levskaya, jekbradbury): verify this id/host ordering on TPU v4
     device_id = coords_to_idx((c, x, y, z), (nc, nx, ny, nz))  # pytype: disable=wrong-arg-types
     process_index = coords_to_idx((hc, hx, hy, hz), (hnc, hnx, hny, hnz))  # pytype: disable=wrong-arg-types
@@ -234,10 +236,25 @@ def get_fake_tokenized_dataset(*_, split='validation', **__):
   return ds
 
 
+def assert_equal(a, b):
+  """Check equality of LazyArray / GDA / other array."""
+  assert isinstance(a,
+                    type(b)), f'Found incompatible types: {type(a)}, {type(b)}'
+  if isinstance(a, LazyArray):
+    a = a.get()
+  if isinstance(b, LazyArray):
+    b = b.get()
+  if not isinstance(a, GlobalDeviceArray):
+    np.testing.assert_array_equal(a, b)
+  else:
+    for s1, s2 in zip(a.local_shards, b.local_shards):
+      np.testing.assert_array_equal(s1.data, s2.data)
+
+
 def assert_same(tree_a, tree_b):
   """Asserts that both trees are the same."""
   tree_a, tree_b = jax.device_get((tree_a, tree_b))
-  jax.tree_multimap(np.testing.assert_array_equal, tree_a, tree_b)
+  jax.tree_map(assert_equal, tree_a, tree_b)
 
 
 def get_train_state_from_variables(variables,

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Tests for t5x.checkpoints."""
+# TODO(b/234480674): Deprecate this test in favor of gda_checkpoints_test.
 import concurrent.futures
 import functools
 import itertools
@@ -26,6 +27,7 @@ from flax import serialization
 from flax import traverse_util
 from flax.metrics import tensorboard
 import jax
+from jax._src.lib import xla_bridge
 import jax.numpy as jnp
 import numpy as np
 from t5x import checkpoints
@@ -153,7 +155,7 @@ class CheckpointsTest(parameterized.TestCase):
       step_dir = fake_checkpoints.mkdir(f'checkpoint_{step}')
       step_dir.create_file('checkpoint')
 
-  @mock.patch('jax._src.lib.xla_bridge.process_index')
+  @mock.patch.object(xla_bridge, 'process_index')
   @mock.patch('jax.devices')
   @mock.patch('jax.local_devices')
   def get_partitioner(self,
@@ -253,7 +255,8 @@ class CheckpointsTest(parameterized.TestCase):
         self.tmp_dir,
         ds_iter,
         save_dtype=save_dtype,
-        restore_dtype=restore_dtype)
+        restore_dtype=restore_dtype,
+        use_gda=False)
     return fn(checkpointer)
 
   # pylint:disable=no-value-for-parameter
@@ -276,7 +279,8 @@ class CheckpointsTest(parameterized.TestCase):
         partitioner,
         self.tmp_dir,
         ds_iter,
-        save_dtype=save_dtype)
+        save_dtype=save_dtype,
+        use_gda=False)
     return fn(checkpointer)
 
   def test_get_parameter_infos(self):
@@ -292,8 +296,8 @@ class CheckpointsTest(parameterized.TestCase):
         step=np.int32(42))
     # host 3 of a 4x4 with mesh 'model' dim == 16
     partitioner = self.get_partitioner(3, 4, 16)
-    checkpointer = checkpoints.Checkpointer(train_state, partitioner,
-                                            self.tmp_dir)
+    checkpointer = checkpoints.Checkpointer(
+        train_state, partitioner, self.tmp_dir, use_gda=False)
 
     expected_parameter_infos = {
         'state': {
@@ -363,8 +367,8 @@ class CheckpointsTest(parameterized.TestCase):
                         replica_id=1), axes=PartitionSpec(None, 'model'))
         }
     }  # pyformat: disable
-    jax.tree_multimap(self.assertEqual, checkpointer._get_parameter_infos(),
-                      expected_parameter_infos)
+    jax.tree_map(self.assertEqual, checkpointer._get_parameter_infos(),
+                 expected_parameter_infos)
 
   def test_get_multioptimizer_parameter_infos(self):
     train_state = make_train_state(
@@ -381,8 +385,8 @@ class CheckpointsTest(parameterized.TestCase):
         })
     # host 3 of a 4x4 with mesh 'model' dim == 16
     partitioner = self.get_partitioner(3, 4, 16)
-    checkpointer = checkpoints.Checkpointer(train_state, partitioner,
-                                            self.tmp_dir)
+    checkpointer = checkpoints.Checkpointer(
+        train_state, partitioner, self.tmp_dir, use_gda=False)
     kernel_state_info = (
         checkpointer._get_parameter_infos()['state']['param_states']['kernel'])
     self.assertIsNone(kernel_state_info)
@@ -490,8 +494,8 @@ class CheckpointsTest(parameterized.TestCase):
       self.assertEqual(actual_train_state.step, step)
       self.assertEqual(actual_train_state.step.dtype, np.int32)
       self.assertEqual(actual_train_state._optimizer.state.step.dtype, np.int32)
-      jax.tree_multimap(np.testing.assert_array_equal,
-                        actual_train_state.param_states, param_states)
+      jax.tree_map(np.testing.assert_array_equal,
+                   actual_train_state.param_states, param_states)
       self.assertEqual(actual_train_state.param_states['kernel'].dtype,
                        np.uint8)
       self.assertSameElements(actual_train_state.params, ('bias', 'kernel'))
@@ -544,8 +548,8 @@ class CheckpointsTest(parameterized.TestCase):
                    actual_optimizer.target)
       self.assertEqual(actual_step, step)
       self.assertEqual(actual_step.dtype, np.int32)
-      jax.tree_multimap(np.testing.assert_array_equal, actual_param_states,
-                        param_states)
+      jax.tree_map(np.testing.assert_array_equal, actual_param_states,
+                   param_states)
       self.assertSameElements(actual_params, ('bias', 'kernel'))
       self.assertTrue(
           all(
@@ -681,16 +685,16 @@ class CheckpointsTest(parameterized.TestCase):
     with gfile.GFile(f'{self.tmp_dir}/checkpoint_{step}/checkpoint', 'rb') as f:
       ckpt_contents = serialization.msgpack_restore(f.read())
     self.assertEqual(ckpt_contents['version'], checkpoints.VERSION)
-    jax.tree_multimap(np.testing.assert_allclose,
-                      ckpt_contents['optimizer']['state']['param_states'],
-                      param_states)
+    jax.tree_map(np.testing.assert_allclose,
+                 ckpt_contents['optimizer']['state']['param_states'],
+                 param_states)
     self.assertEqual(ckpt_contents['optimizer']['state']['step'].dtype,
                      np.int32)
     if disable_partitioning:
       # Parameters should also be in the msgpack checkpoint file.
-      jax.tree_multimap(
-          np.testing.assert_allclose, ckpt_contents['optimizer']['target'],
-          jax.tree_map(lambda arr: arr.astype(save_dtype), params))
+      jax.tree_map(np.testing.assert_allclose,
+                   ckpt_contents['optimizer']['target'],
+                   jax.tree_map(lambda arr: arr.astype(save_dtype), params))
 
     # Jax tree maps ignore Nones so actually check this value is None
     if multi_optimizer:
@@ -737,14 +741,14 @@ class CheckpointsTest(parameterized.TestCase):
   def test_load_t5x_checkpoint(self):
     self.validate_save(1, 1)
     ckpt = checkpoints.load_t5x_checkpoint(self.tmp_dir)
-    jax.tree_multimap(np.testing.assert_array_equal,
-                      self.train_state.state_dict(), ckpt)
+    jax.tree_map(np.testing.assert_array_equal, self.train_state.state_dict(),
+                 ckpt)
 
   def test_load_t5x_checkpoint_of_multioptimizer(self):
     self.validate_save(1, 1, multi_optimizer=True)
     ckpt = checkpoints.load_t5x_checkpoint(self.tmp_dir)
-    jax.tree_multimap(np.testing.assert_array_equal,
-                      self.train_state_multi_optimizer.state_dict(), ckpt)
+    jax.tree_map(np.testing.assert_array_equal,
+                 self.train_state_multi_optimizer.state_dict(), ckpt)
     # Jax tree maps ignore Nones so actually check this value is None
     self.assertIsNone(ckpt['state']['param_states']['kernel'])
 
@@ -754,7 +758,7 @@ class CheckpointsTest(parameterized.TestCase):
     lazy_ckpt = checkpoints.load_t5x_checkpoint(
         self.tmp_dir, lazy_parameters=True)
     lazy_loaded_ckpt = jax.tree_map(lambda x: x.get(), lazy_ckpt)
-    jax.tree_multimap(np.testing.assert_array_equal, ckpt, lazy_loaded_ckpt)
+    jax.tree_map(np.testing.assert_array_equal, ckpt, lazy_loaded_ckpt)
 
   def test_load_t5x_checkpoint_of_multioptimizer_lazy(self):
     self.validate_save(1, 1, multi_optimizer=True)
@@ -762,7 +766,7 @@ class CheckpointsTest(parameterized.TestCase):
     lazy_ckpt = checkpoints.load_t5x_checkpoint(
         self.tmp_dir, lazy_parameters=True)
     lazy_loaded_ckpt = jax.tree_map(lambda x: x.get(), lazy_ckpt)
-    jax.tree_multimap(np.testing.assert_array_equal, ckpt, lazy_loaded_ckpt)
+    jax.tree_map(np.testing.assert_array_equal, ckpt, lazy_loaded_ckpt)
     # Jax tree maps ignore Nones so actually check this value is None
     self.assertIsNone(lazy_loaded_ckpt['state']['param_states']['kernel'])
 
@@ -823,7 +827,11 @@ class CheckpointsTest(parameterized.TestCase):
     no_partitions_partitioner = self.get_partitioner(0, 1, 1)
     train_state = self.train_state
     checkpointer = checkpoints.Checkpointer(
-        train_state, no_partitions_partitioner, self.tmp_dir, keep=2)
+        train_state,
+        no_partitions_partitioner,
+        self.tmp_dir,
+        keep=2,
+        use_gda=False)
 
     checkpointer.save(update_train_state_step(train_state, 42))
     self.assertSequenceEqual(checkpointer.all_steps(), [42])
@@ -847,7 +855,11 @@ class CheckpointsTest(parameterized.TestCase):
     no_partitions_partitioner = self.get_partitioner(0, 1, 1)
     train_state = self.train_state
     checkpointer = checkpoints.Checkpointer(
-        train_state, no_partitions_partitioner, self.tmp_dir, keep=1)
+        train_state,
+        no_partitions_partitioner,
+        self.tmp_dir,
+        keep=1,
+        use_gda=False)
 
     checkpointer.save(update_train_state_step(train_state, 42))
     self.assertSequenceEqual(checkpointer.all_steps(), [42])
@@ -868,6 +880,78 @@ class CheckpointsTest(parameterized.TestCase):
     self.assertSequenceEqual(checkpointer.all_steps(), [42, 44])
 
   @mock.patch('time.time', return_value=0)
+  def test_keep_dataset_checkpoints(self, unused_mock_time):
+    no_partitions_partitioner = self.get_partitioner(0, 1, 1)
+    train_state = self.train_state
+    dataset_iterator = iter(tf.data.Dataset.range(10))
+    checkpointer = checkpoints.Checkpointer(
+        train_state,
+        no_partitions_partitioner,
+        self.tmp_dir,
+        dataset_iterator=dataset_iterator,
+        keep=2,
+        keep_dataset_checkpoints=1,
+        use_gda=False)
+
+    checkpointer.save(update_train_state_step(train_state, 42))
+    self.assertSequenceEqual(checkpointer.all_steps(), [42])
+    self.assertSequenceEqual(checkpointer.all_dataset_checkpoint_steps(), [42])
+
+    checkpointer.save(update_train_state_step(train_state, 43))
+    self.assertSequenceEqual(checkpointer.all_steps(), [42, 43])
+    self.assertSequenceEqual(checkpointer.all_dataset_checkpoint_steps(), [43])
+
+    checkpointer.save(update_train_state_step(train_state, 44))
+    self.assertSequenceEqual(checkpointer.all_steps(), [43, 44])
+    self.assertSequenceEqual(checkpointer.all_dataset_checkpoint_steps(), [44])
+
+    checkpointer.keep = 1
+    checkpointer.save(update_train_state_step(train_state, 45))
+    self.assertSequenceEqual(checkpointer.all_steps(), [45])
+    self.assertSequenceEqual(checkpointer.all_dataset_checkpoint_steps(), [45])
+
+    checkpointer.keep = 3
+    checkpointer.save(update_train_state_step(train_state, 46))
+    self.assertSequenceEqual(checkpointer.all_steps(), [45, 46])
+    self.assertSequenceEqual(checkpointer.all_dataset_checkpoint_steps(), [46])
+
+  @mock.patch('time.time', return_value=0)
+  def test_keep_dataset_checkpoints_pinned(self, unused_mock_time):
+    no_partitions_partitioner = self.get_partitioner(0, 1, 1)
+    train_state = self.train_state
+    dataset_iterator = iter(tf.data.Dataset.range(10))
+    checkpointer = checkpoints.Checkpointer(
+        train_state,
+        no_partitions_partitioner,
+        self.tmp_dir,
+        dataset_iterator=dataset_iterator,
+        keep=1,
+        keep_dataset_checkpoints=1,
+        use_gda=False)
+
+    checkpointer.save(update_train_state_step(train_state, 42))
+    self.assertSequenceEqual(checkpointer.all_steps(), [42])
+
+    # Mark the checkpoint as pinned by creating the ALWAYS KEEP file.
+    ckpt_dir = self.checkpoints_dir.mkdir(f'checkpoint_{42}')
+    ckpt_dir.create_file('PINNED')
+
+    checkpointer.save(update_train_state_step(train_state, 43))
+
+    # Assert both the pinned and the most recent checkpoints are saved.
+    self.assertSequenceEqual(checkpointer.all_steps(), [42, 43])
+    self.assertSequenceEqual(checkpointer.all_dataset_checkpoint_steps(),
+                             [42, 43])
+
+    checkpointer.save(update_train_state_step(train_state, 44))
+
+    # Assert the non-pinned checkpoint gets deleted, but the pinned and the most
+    # recent one are still saved.
+    self.assertSequenceEqual(checkpointer.all_steps(), [42, 44])
+    self.assertSequenceEqual(checkpointer.all_dataset_checkpoint_steps(),
+                             [42, 44])
+
+  @mock.patch('time.time', return_value=0)
   def test_keep_with_save_best_checkpointer(self, unused_mock_time):
     no_partitions_partitioner = self.get_partitioner(0, 1, 1)
     train_state = self.train_state
@@ -879,7 +963,8 @@ class CheckpointsTest(parameterized.TestCase):
         keep=2,
         metric_name_to_monitor='train/accuracy',
         metric_mode='max',
-        keep_checkpoints_without_metrics=False)
+        keep_checkpoints_without_metrics=False,
+        use_gda=False)
 
     # Test that without a valid set of metrics deletion falls back to oldest
     # step (since keep_checkpoints_without_metrics is set to False).
@@ -927,7 +1012,8 @@ class CheckpointsTest(parameterized.TestCase):
         keep=2,
         metric_name_to_monitor='train/accuracy',
         metric_mode='max',
-        keep_checkpoints_without_metrics=False)
+        keep_checkpoints_without_metrics=False,
+        use_gda=False)
 
     summary_writer = tensorboard.SummaryWriter(
         os.path.join(self.tmp_dir, 'train'))
@@ -973,7 +1059,8 @@ class CheckpointsTest(parameterized.TestCase):
         self.tmp_dir,
         keep=1,
         metric_name_to_monitor='train/accuracy',
-        metric_mode='max')
+        metric_mode='max',
+        use_gda=False)
 
     # Pre-create metrics for only some of the steps.
     summary_writer = tensorboard.SummaryWriter(
@@ -1011,7 +1098,11 @@ class CheckpointsTest(parameterized.TestCase):
 
     # First, create a checkpointer that saves all checkpoints.
     checkpointer = checkpoints.Checkpointer(
-        train_state, no_partitions_partitioner, self.tmp_dir, keep=None)
+        train_state,
+        no_partitions_partitioner,
+        self.tmp_dir,
+        keep=None,
+        use_gda=False)
 
     # Create a series of checkpoints. Create many checkpoints to stress test
     # event collection (some methods employ lossy/sampling collection).
@@ -1036,7 +1127,8 @@ class CheckpointsTest(parameterized.TestCase):
         self.tmp_dir,
         keep=2,
         metric_name_to_monitor='train/accuracy',
-        metric_mode='max')
+        metric_mode='max',
+        use_gda=False)
 
     # Verify that pre-existing metrics are read and the appropriate checkpoints
     # are deleted.
@@ -1055,7 +1147,8 @@ class CheckpointsTest(parameterized.TestCase):
         metric_name_to_monitor='train/accuracy',
         metric_mode='max',
         keep_checkpoints_without_metrics=False,
-        force_keep_period=3)
+        force_keep_period=3,
+        use_gda=False)
 
     summary_writer = tensorboard.SummaryWriter(
         os.path.join(self.tmp_dir, 'train'))
@@ -1090,7 +1183,8 @@ class CheckpointsTest(parameterized.TestCase):
         self.tmp_dir,
         keep=1,
         metric_name_to_monitor='train/accuracy',
-        metric_mode='max')
+        metric_mode='max',
+        use_gda=False)
 
     # Pre-create metrics for only some of the steps.
     summary_writer = tensorboard.SummaryWriter(
@@ -1161,11 +1255,10 @@ class CheckpointsTest(parameterized.TestCase):
     self.assertEqual(actual_train_state.step, 42)
     self.assertEqual(actual_train_state._optimizer.optimizer_def,
                      self.train_state._optimizer.optimizer_def)
-    jax.tree_multimap(np.testing.assert_array_equal,
-                      actual_train_state.param_states,
-                      self.train_state.param_states)
-    jax.tree_multimap(np.testing.assert_array_equal, actual_train_state.params,
-                      self.train_state.params)
+    jax.tree_map(np.testing.assert_array_equal, actual_train_state.param_states,
+                 self.train_state.param_states)
+    jax.tree_map(np.testing.assert_array_equal, actual_train_state.params,
+                 self.train_state.params)
 
   def test_assignment_map_unused(self):
     self.validate_save(1, 1)
@@ -1272,11 +1365,10 @@ class CheckpointsTest(parameterized.TestCase):
     self.assertEqual(actual_train_state._optimizer.optimizer_def,
                      self.train_state._optimizer.optimizer_def)
     self.assertEqual(actual_train_state.step, 1337)  # note: from-scratch
-    jax.tree_multimap(np.testing.assert_array_equal,
-                      actual_train_state.param_states,
-                      self.train_state.param_states)
-    jax.tree_multimap(np.testing.assert_array_equal, actual_train_state.params,
-                      self.train_state.params)
+    jax.tree_map(np.testing.assert_array_equal, actual_train_state.param_states,
+                 self.train_state.param_states)
+    jax.tree_map(np.testing.assert_array_equal, actual_train_state.params,
+                 self.train_state.params)
 
   def verify_restore_checkpoint_from_path(
       self,
@@ -1298,8 +1390,10 @@ class CheckpointsTest(parameterized.TestCase):
         partitioner=partitioner)
 
     restored = list(
-        train_state_initializer.from_checkpoints(
-            [utils.RestoreCheckpointConfig(mode='specific', path=path)]))
+        train_state_initializer.from_checkpoints([
+            utils.RestoreCheckpointConfig(
+                mode='specific', path=path, use_gda=False)
+        ]))
     self.assertLen(restored, 1)
     return restored[0]
 
@@ -1401,8 +1495,8 @@ class CheckpointsTest(parameterized.TestCase):
         lambda x: x.get()  # pylint: disable=g-long-lambda
         if isinstance(x, LazyArray) else x,
         train_state)
-    jax.tree_multimap(np.testing.assert_allclose, train_state.state_dict(),
-                      loaded_train_state)
+    jax.tree_map(np.testing.assert_allclose, train_state.state_dict(),
+                 loaded_train_state)
 
   def test_update_ts_from_gfile_to_gcs(self):
     ckpt_contents = {
@@ -1441,7 +1535,8 @@ class CheckpointsTest(parameterized.TestCase):
                     'dtype': 'float32',
                     'kvstore': {
                         'bucket': 't5x-dummy-bucket',
-                        'driver': 'gcs'
+                        'driver': 'gcs',
+                        'path': 'target.sharded_param'
                     },
                     'metadata': {
                         'chunks': [768, 768],
@@ -1450,14 +1545,13 @@ class CheckpointsTest(parameterized.TestCase):
                             'level': 1
                         },
                         'shape': [768, 768]
-                    },
-                    'path': 'target.sharded_param',
+                    }
                 }
             }
         }
     }
     actual = checkpoints._maybe_update_ts_from_file_to_gcs(ckpt_contents)
-    jax.tree_multimap(np.testing.assert_array_equal, actual, expected)
+    jax.tree_map(np.testing.assert_array_equal, actual, expected)
 
   def test_update_ts_from_gcs_to_file(self):
     ckpt_contents = {
@@ -1471,7 +1565,8 @@ class CheckpointsTest(parameterized.TestCase):
                     'dtype': 'float32',
                     'kvstore': {
                         'bucket': 't5x-dummy-bucket',
-                        'driver': 'gcs'
+                        'driver': 'gcs',
+                        'path': 'target.sharded_param'
                     },
                     'metadata': {
                         'chunks': [768, 768],
@@ -1481,7 +1576,6 @@ class CheckpointsTest(parameterized.TestCase):
                         },
                         'shape': [768, 768]
                     },
-                    'path': 'target.sharded_param',
                 }
             }
         }
@@ -1514,7 +1608,7 @@ class CheckpointsTest(parameterized.TestCase):
     }
 
     actual = checkpoints._maybe_update_ts_from_gcs_to_file(ckpt_contents)
-    jax.tree_multimap(np.testing.assert_array_equal, actual, expected)
+    jax.tree_map(np.testing.assert_array_equal, actual, expected)
 
   def assert_update_ts_path_from_relative_to_absolute(self, ts_spec_dict,
                                                       expected, ckpt_dir):
@@ -1526,13 +1620,13 @@ class CheckpointsTest(parameterized.TestCase):
         ckpt_dir, normalized_ts_spec_dict)
     normalized_ts_spec_dict = ts.Spec(normalized_ts_spec_dict).to_json()
     normalized_expected = ts.Spec(expected).to_json()
-    jax.tree_multimap(np.testing.assert_array_equal, normalized_ts_spec_dict,
-                      normalized_expected)
+    jax.tree_map(np.testing.assert_array_equal, normalized_ts_spec_dict,
+                 normalized_expected)
 
     # Test without normalization (corresponds to tensorstore<0.1.14)
     checkpoints._update_ts_path_from_relative_to_absolute(
         ckpt_dir, ts_spec_dict)
-    jax.tree_multimap(np.testing.assert_array_equal, ts_spec_dict, expected)
+    jax.tree_map(np.testing.assert_array_equal, ts_spec_dict, expected)
 
   def test_update_ts_path_from_relative_to_absolute_gfile(self):
     ts_spec_dict = {
@@ -1656,8 +1750,8 @@ class CheckpointsTest(parameterized.TestCase):
       return FlaxOptimTrainState.create(model.optimizer_def, initial_variables)
 
     train_state = jax.eval_shape(initialize_params_fn, jax.random.PRNGKey(0))
-    checkpointer = checkpoints.Checkpointer(train_state, partitioner,
-                                            self.tmp_dir)
+    checkpointer = checkpoints.Checkpointer(
+        train_state, partitioner, self.tmp_dir, use_gda=False)
     _ = checkpointer.convert_from_tf_checkpoint(checkpoint_path)
 
   def test_load_matched(self):
@@ -1666,7 +1760,7 @@ class CheckpointsTest(parameterized.TestCase):
         checkpoint, test_utils.get_t5_test_model())
     state_dict = train_state._optimizer.state_dict()
     ckpt = checkpoints.load_t5x_checkpoint(checkpoint)
-    jax.tree_multimap(np.testing.assert_array_equal, state_dict, ckpt)
+    jax.tree_map(np.testing.assert_array_equal, state_dict, ckpt)
 
 
 

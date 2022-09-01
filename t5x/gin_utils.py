@@ -14,7 +14,7 @@
 
 """Utilities for using gin configurations with T5X binaries."""
 import os
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 from absl import app
 from absl import logging
@@ -28,7 +28,7 @@ import tensorflow as tf
 def parse_gin_flags(gin_search_paths: Sequence[str],
                     gin_files: Sequence[str],
                     gin_bindings: Sequence[str],
-                    skip_unknown: bool = False,
+                    skip_unknown: Union[bool, Sequence[str]] = False,
                     finalize_config: bool = True):
   """Parses provided gin files override params.
 
@@ -41,7 +41,7 @@ def parse_gin_flags(gin_search_paths: Sequence[str],
       parsed. Will be applied in order with conflicting settings being overriden
       by later oens.
     skip_unknown: whether to ignore unknown bindings or raise an error (default
-      behavior).
+      behavior). Alternatively, a list of configurable names to skip if unknown.
     finalize_config: whether to finalize the config so that it cannot be
       modified (default behavior).
   """
@@ -60,7 +60,9 @@ def parse_gin_flags(gin_search_paths: Sequence[str],
       gin_bindings,
       skip_unknown=skip_unknown,
       finalize_config=finalize_config)
-  logging.info('Gin Configuration:\n%s', gin.config_str())
+  logging.info('Gin Configuration:')
+  for line in gin.config_str().splitlines():
+    logging.info('%s', line)
 
 
 def rewrite_gin_args(args: Sequence[str]) -> Sequence[str]:
@@ -104,7 +106,7 @@ def run(main):
   """Wrapper for app.run that rewrites gin args before parsing."""
   app.run(
       main,
-      flags_parser=lambda a: app.parse_flags_with_usage(rewrite_gin_args(a)))
+      flags_parser=lambda a: app.parse_flags_with_usage(rewrite_gin_args(a)))  # pytype: disable=wrong-arg-types
 
 
 # ====================== Configurable Utility Functions ======================

@@ -15,7 +15,6 @@
 """Tests for train_state."""
 from absl.testing import absltest
 from flax import linen as nn
-from flax import optim
 import flax.core
 from flax.linen import partitioning as flax_partitioning
 import jax
@@ -45,9 +44,9 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
     self.assertIsInstance(state._optimizer, optimizers.Optimizer)
     self.assertEqual(state.state_dict()['flax_mutables'],
                      flax.core.unfreeze(flax_mutables))
-    jax.tree_multimap(np.testing.assert_array_equal, params, state.params)
-    jax.tree_multimap(np.testing.assert_array_equal,
-                      optimizer.state.param_states, state.param_states)
+    jax.tree_map(np.testing.assert_array_equal, params, state.params)
+    jax.tree_map(np.testing.assert_array_equal, optimizer.state.param_states,
+                 state.param_states)
 
   def test_create(self):
     model_variables = flax.core.freeze({
@@ -65,10 +64,10 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
     self.assertEqual(state.step, 0)
     self.assertIsInstance(state._optimizer, optimizers.Optimizer)
     self.assertEqual(state._optimizer.optimizer_def, optimizer_def)
-    jax.tree_multimap(np.testing.assert_array_equal, state.flax_mutables,
-                      flax.core.freeze({'mutables': np.ones(3)}))
-    jax.tree_multimap(np.testing.assert_array_equal, state.params,
-                      model_variables['params'])
+    jax.tree_map(np.testing.assert_array_equal, state.flax_mutables,
+                 flax.core.freeze({'mutables': np.ones(3)}))
+    jax.tree_map(np.testing.assert_array_equal, state.params,
+                 model_variables['params'])
     self.assertIsNone(state.params_axes)
 
   def test_create_with_params_axes(self):
@@ -103,10 +102,10 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
             'dense/kernel': (FactorDim.COLUMN, FactorDim.ROW)
         })
     self.assertEqual(state.flax_mutables, flax.core.freeze({}))
-    jax.tree_multimap(np.testing.assert_array_equal, model_variables['params'],
-                      state.params)
-    jax.tree_multimap(np.testing.assert_array_equal,
-                      model_variables['params_axes'], state.params_axes)
+    jax.tree_map(np.testing.assert_array_equal, model_variables['params'],
+                 state.params)
+    jax.tree_map(np.testing.assert_array_equal, model_variables['params_axes'],
+                 state.params_axes)
 
   def test_create_with_flax_mutables_axes(self):
     model_variables = flax.core.freeze({
@@ -151,13 +150,12 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
         })
     self.assertEqual(state.flax_mutables,
                      flax.core.freeze({'grads': model_variables['grads']}))
-    jax.tree_multimap(np.testing.assert_array_equal, model_variables['params'],
-                      state.params)
-    jax.tree_multimap(np.testing.assert_array_equal,
-                      model_variables['params_axes'], state.params_axes)
-    jax.tree_multimap(np.testing.assert_array_equal,
-                      model_variables['grads_axes'],
-                      state.flax_mutables_axes['grads'])
+    jax.tree_map(np.testing.assert_array_equal, model_variables['params'],
+                 state.params)
+    jax.tree_map(np.testing.assert_array_equal, model_variables['params_axes'],
+                 state.params_axes)
+    jax.tree_map(np.testing.assert_array_equal, model_variables['grads_axes'],
+                 state.flax_mutables_axes['grads'])
 
   def test_create_missing_params_axes(self):
     model_variables = flax.core.freeze({
@@ -203,12 +201,11 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
 
     new_params = {'test': np.zeros(10)}
     new_state = state.replace_params(new_params)
-    jax.tree_multimap(np.testing.assert_array_equal, new_params,
-                      new_state.params)
+    jax.tree_map(np.testing.assert_array_equal, new_params, new_state.params)
     expected_state_dict = state.state_dict()
     expected_state_dict['target'] = new_params
-    jax.tree_multimap(np.testing.assert_array_equal, expected_state_dict,
-                      new_state.state_dict())
+    jax.tree_map(np.testing.assert_array_equal, expected_state_dict,
+                 new_state.state_dict())
 
   def test_replace_step(self):
     optimizer_def = optimizers.adam(0.1)
@@ -261,7 +258,7 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
                                                        model_variables)
     axes_state = state.as_logical_axes()
     self.assertIsNone(axes_state.params_axes)
-    jax.tree_multimap(
+    jax.tree_map(
         np.testing.assert_array_equal, axes_state.params,
         flax.core.freeze({
             'dense': {
@@ -305,7 +302,7 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
                                                        model_variables)
     axes_state = state.as_logical_axes()
     self.assertIsNone(axes_state.params_axes)
-    jax.tree_multimap(
+    jax.tree_map(
         np.testing.assert_array_equal, axes_state.flax_mutables,
         flax.core.freeze({
             'grads': {
@@ -314,30 +311,6 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
                 }
             }
         }))
-
-  def test_as_logical_axes_unsupported_optimizer(self):
-    model_variables = flax.core.freeze({
-        'params': {
-            'dense': {
-                'bias': np.zeros(4),
-                'kernel': np.zeros((2, 4))
-            }
-        },
-        'params_axes': {
-            'dense': {
-                'bias_axes': AxisMetadata(names=('embed',)),
-                'kernel_axes': AxisMetadata(names=('vocab', 'embed')),
-            }
-        },
-    })
-    optimizer_def = optim.GradientDescent(0.42)
-    state = train_state_lib.FlaxOptimTrainState.create(optimizer_def,
-                                                       model_variables)
-    with self.assertRaisesWithLiteralMatch(
-        ValueError,
-        "Optimizer 'GradientDescent' requires a `derive_logical_axes` method "
-        'to be used with named axis partitioning.'):
-      state.as_logical_axes()
 
   def test_to_state_dict(self):
     model_variables = flax.core.freeze({
@@ -357,7 +330,7 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
         })
     state = train_state_lib.FlaxOptimTrainState.create(optimizer_def,
                                                        model_variables)
-    jax.tree_multimap(
+    jax.tree_map(
         np.testing.assert_array_equal, state.state_dict(), {
             'state': {
                 'step': np.array(0),
@@ -419,19 +392,19 @@ class FlaxOptimTrainStateTest(absltest.TestCase):
     self.assertEqual(restored.step, 1)
     self.assertIsInstance(restored._optimizer, optimizers.Optimizer)
     self.assertEqual(restored._optimizer.optimizer_def, optimizer_def)
-    jax.tree_multimap(np.testing.assert_array_equal, restored.flax_mutables,
-                      flax.core.freeze({'mutables': np.zeros(3)}))
-    jax.tree_multimap(np.testing.assert_array_equal, restored.params,
-                      flax.core.freeze({'kernel': np.ones((2, 4))}))
-    jax.tree_multimap(
+    jax.tree_map(np.testing.assert_array_equal, restored.flax_mutables,
+                 flax.core.freeze({'mutables': np.zeros(3)}))
+    jax.tree_map(np.testing.assert_array_equal, restored.params,
+                 flax.core.freeze({'kernel': np.ones((2, 4))}))
+    jax.tree_map(
         np.testing.assert_array_equal, restored.param_states,
         flax.core.freeze({
             'kernel':
                 adafactor._AdafactorParamState(
                     np.ones(1), np.ones(1), np.ones((2, 4)), np.ones(1))
         }))
-    jax.tree_multimap(np.testing.assert_array_equal, restored.params_axes,
-                      model_variables['params_axes'])
+    jax.tree_map(np.testing.assert_array_equal, restored.params_axes,
+                 model_variables['params_axes'])
 
 
 class InferenceStateTest(absltest.TestCase):
@@ -445,7 +418,7 @@ class InferenceStateTest(absltest.TestCase):
         step=jax.numpy.array(1), params=params, flax_mutables=flax_mutables)
     self.assertEqual(state.step, 1)
     self.assertEqual(state.flax_mutables, flax.core.unfreeze(flax_mutables))
-    jax.tree_multimap(np.testing.assert_array_equal, params, state.params)
+    jax.tree_map(np.testing.assert_array_equal, params, state.params)
     self.assertIsNone(state.params_axes)
 
   def test_create(self):
@@ -466,12 +439,12 @@ class InferenceStateTest(absltest.TestCase):
     })
     state = train_state_lib.InferenceState.create(model_variables)
     self.assertEqual(state.step, 0)
-    jax.tree_multimap(np.testing.assert_array_equal, state.flax_mutables,
-                      flax.core.freeze({'mutables': np.ones(3)}))
-    jax.tree_multimap(np.testing.assert_array_equal, state.params,
-                      model_variables['params'])
-    jax.tree_multimap(np.testing.assert_array_equal, state.params_axes,
-                      model_variables['params_axes'])
+    jax.tree_map(np.testing.assert_array_equal, state.flax_mutables,
+                 flax.core.freeze({'mutables': np.ones(3)}))
+    jax.tree_map(np.testing.assert_array_equal, state.params,
+                 model_variables['params'])
+    jax.tree_map(np.testing.assert_array_equal, state.params_axes,
+                 model_variables['params_axes'])
 
   def test_create_mismatched_params_axes(self):
     model_variables = flax.core.freeze({
@@ -498,8 +471,7 @@ class InferenceStateTest(absltest.TestCase):
 
     new_params = {'test': np.zeros(10)}
     new_state = state.replace_params(new_params)
-    jax.tree_multimap(np.testing.assert_array_equal, new_params,
-                      new_state.params)
+    jax.tree_map(np.testing.assert_array_equal, new_params, new_state.params)
 
   def test_replace_step(self):
     model_variables = flax.core.freeze({'params': {'test': np.ones(10)}})
@@ -526,7 +498,7 @@ class InferenceStateTest(absltest.TestCase):
     state = train_state_lib.InferenceState.create(model_variables)
     axes_state = state.as_logical_axes()
     self.assertIsNone(axes_state.params_axes)
-    jax.tree_multimap(
+    jax.tree_map(
         np.testing.assert_array_equal, axes_state.params,
         flax.core.freeze({
             'dense': {
@@ -546,7 +518,7 @@ class InferenceStateTest(absltest.TestCase):
         'mutables': np.ones(3)
     })
     state = train_state_lib.InferenceState.create(model_variables)
-    jax.tree_multimap(
+    jax.tree_map(
         np.testing.assert_array_equal, state.state_dict(), {
             'state': {
                 'step': np.array(0)
@@ -569,7 +541,7 @@ class InferenceStateTest(absltest.TestCase):
         },
     })
     state = train_state_lib.InferenceState.create(model_variables)
-    jax.tree_multimap(np.testing.assert_array_equal, state.state_dict(), {
+    jax.tree_map(np.testing.assert_array_equal, state.state_dict(), {
         'state': {
             'step': np.array(0)
         },
@@ -597,10 +569,10 @@ class InferenceStateTest(absltest.TestCase):
     restored = state.restore_state(state_dict)
 
     self.assertEqual(restored.step, 10)
-    jax.tree_multimap(np.testing.assert_array_equal, restored.flax_mutables,
-                      flax.core.freeze(state_dict['flax_mutables']))
-    jax.tree_multimap(np.testing.assert_array_equal, restored.params,
-                      flax.core.freeze(state_dict['target']))
+    jax.tree_map(np.testing.assert_array_equal, restored.flax_mutables,
+                 flax.core.freeze(state_dict['flax_mutables']))
+    jax.tree_map(np.testing.assert_array_equal, restored.params,
+                 flax.core.freeze(state_dict['target']))
     self.assertEqual(restored.params_axes,
                      {'bias_axes': AxisMetadata(names=('embed',))})
 
@@ -619,8 +591,8 @@ class InferenceStateTest(absltest.TestCase):
 
     self.assertEqual(restored.step, 10)
     self.assertEqual(restored.flax_mutables, train_state_lib.EMPTY_DICT)
-    jax.tree_multimap(np.testing.assert_array_equal, restored.params,
-                      flax.core.freeze(state_dict['target']))
+    jax.tree_map(np.testing.assert_array_equal, restored.params,
+                 flax.core.freeze(state_dict['target']))
     self.assertIsNone(restored.params_axes)
 
 

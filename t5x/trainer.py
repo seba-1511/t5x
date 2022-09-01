@@ -23,13 +23,13 @@ import enum
 import os
 import threading
 import time
-from typing import Any, Dict, Iterator, Mapping, MutableMapping, Optional, Sequence, TYPE_CHECKING, Tuple, Union
-import warnings
+from typing import Any, Dict, Iterator, Mapping, MutableMapping, Optional, Sequence, TYPE_CHECKING, Tuple, Union, Protocol
 
 from absl import logging
 import cached_property
 from clu import asynclib
 from clu import metric_writers
+import clu.data
 import clu.metrics
 import clu.values
 from flax.core import FrozenDict
@@ -56,7 +56,7 @@ MetricMapSpec = Mapping[str, jax.ShapeDtypeStruct]
 MetricValueMapType = Mapping[str, clu.values.Value]
 ModelWeights = Any
 MutableMetricMapType = Dict[str, clu.metrics.Metric]
-PyTreeDef = type(jax.tree_structure(None))
+PyTreeDef = type(jax.tree_util.tree_structure(None))
 PartitionSpec = partitioning.PartitionSpec
 
 if TYPE_CHECKING:  # See b/163639353
@@ -67,13 +67,13 @@ else:
 
 @jax.jit
 def _merge_metrics(a, b):
-  return jax.tree_multimap(
+  return jax.tree_util.tree_map(
       lambda a, b: a.merge(b), a, b, is_leaf=metrics_lib.is_metric_obj)
 
 
 # Merges two metrics pytrees (mapping of metric_name (str) to clu.Metric object)
 def merge_metrics(a, b):
-  a, b = jax.tree_map(utils.get_local_data, (a, b))
+  a, b = jax.tree_util.tree_map(utils.get_local_data, (a, b))
   return _merge_metrics(a, b)
 
 
@@ -189,7 +189,9 @@ class WeightMetricsComputer(object):
     metrics.update(self._make_rms_metrics("weight_gradient_rms", gradients))
     grad_norm = jnp.sqrt(
         jnp.sum(
-            jnp.array([jnp.vdot(x, x) for x in jax.tree_leaves(gradients)])))
+            jnp.array([
+                jnp.vdot(x, x) for x in jax.tree_util.tree_leaves(gradients)
+            ])))
     metrics.update({
         "weight_gradient_norm":
             metrics_lib.AveragePerStep.from_model_output(grad_norm)
@@ -197,8 +199,8 @@ class WeightMetricsComputer(object):
     metrics.update(
         self._make_rms_metrics(
             "weight_update_rms",
-            jax.tree_multimap(jnp.subtract, new_train_state.params,
-                              old_train_state.params)))
+            jax.tree_util.tree_map(jnp.subtract, new_train_state.params,
+                                   old_train_state.params)))
     metrics.update(self._make_max_metrics("weight_max", new_train_state.params))
 
     return metrics
@@ -265,25 +267,17 @@ class MetricsManager(object):
   You should call close() to wait for threads started by this class to finish.
   """
 
-  # TODO(cpgaffney) Remove summarize_fn argument when summarize_metrics_fn is
-  # fully deprecated
-  def __init__(self,
-               name: str,
-               summarize_fn: Optional[SummarizeMetricsCallable] = None,
-               summary_dir: Optional[str] = None):
+  def __init__(self, name: str, summary_dir: Optional[str] = None):
     """MetricsManager constructor.
 
     Constructs an empty MetricWriter on all but host 0.
 
     Args:
       name: an identifier of the metrics to use when logging (e.g., 'train').
-      summarize_fn: a callable to convert the mapping of accumulated metrics
-        into a mapping of scalars to be logged.
       summary_dir: the summary directory. If provided, TensorBoard summaries
         will be written to a `name` subdirectory.
     """
     self._name = name
-    self._summarize_fn = summarize_fn
     if jax.process_index() == 0:
       self._writer = metric_writers.create_default_writer(
           summary_dir,
@@ -362,9 +356,8 @@ class MetricsManager(object):
     duration_future = self._duration_timer.stop(block_on=metrics)
 
     def _summarize_and_write():
-      # For thread safety, since `_summarize_fn` may do additional computations,
-      # we first copy the metrics to host.
-      fetched_metrics = jax.tree_map(jax.device_get, metrics)
+      # For thread safety we first copy the metrics to host.
+      fetched_metrics = jax.tree_util.tree_map(jax.device_get, metrics)
 
       duration = duration_future.result()
       # We set the duration on time-related metrics.
@@ -378,14 +371,11 @@ class MetricsManager(object):
       def _ensure_not_on_device(x):
         assert not isinstance(x, jax.numpy.DeviceArray)
 
-      jax.tree_map(_ensure_not_on_device, final_metrics)
-      final_metrics = jax.tree_map(utils.get_local_data, final_metrics)
+      jax.tree_util.tree_map(_ensure_not_on_device, final_metrics)
+      final_metrics = jax.tree_util.tree_map(utils.get_local_data,
+                                             final_metrics)
 
-      if self._summarize_fn is None:
-        summary = {k: v.compute_value() for k, v in final_metrics.items()}
-      else:
-        summary = self._summarize_fn(
-            metrics=final_metrics, duration=duration, num_steps=num_steps)
+      summary = {k: v.compute_value() for k, v in final_metrics.items()}
       with self._writer_lock:
         metric_writers.write_values(self._writer, int(step), summary)
 
@@ -444,31 +434,15 @@ class BaseTrainer(abc.ABC):
 
     self.stop_training = False
 
-    if hasattr(model, "get_initial_metrics") and callable(
-        getattr(model, "get_initial_metrics")):
-      warnings.warn(
-          "get_initial_metrics is deprecated and will be removed on Mar-01-22."
-          " Please see https://github.com/google-research/text-to-text-transfer-transformer/blob/main/README.mdx/usage/metrics for migration instructions.",
-          DeprecationWarning)
-    summarize_fn = None
-    if hasattr(model, "summarize_metrics_fn") and callable(
-        getattr(model, "summarize_metrics_fn")):
-      warnings.warn(
-          "summarize_metrics_fn is deprecated and will be removed on Mar-01-22."
-          " Please see https://github.com/google-research/text-to-text-transfer-transformer/blob/main/README.mdx/usage/metrics for migration instructions.",
-          DeprecationWarning)
-      summarize_fn = model.summarize_metrics_fn
     # The training metrics combine metrics added by the Model (e.g., loss and
     # accuracy) and Trainer (e.g., learning rate).
     self.train_metrics_manager = MetricsManager(
-        "train", summarize_fn=summarize_fn, summary_dir=summary_dir)
+        "train", summary_dir=summary_dir)
 
     # The eval metrics only include metrics added by the Model.
     self.eval_metrics_managers = {  # pylint:disable=g-complex-comprehension
-        n: MetricsManager(
-            f"training_eval/{n}",
-            summarize_fn=summarize_fn,
-            summary_dir=summary_dir) for n in eval_names
+        n: MetricsManager(f"training_eval/{n}", summary_dir=summary_dir)
+        for n in eval_names
     }
 
   def __enter__(self):
@@ -497,7 +471,7 @@ class BaseTrainer(abc.ABC):
       self._train_state = train_state
 
   def train(self,
-            batch_iter: Iterator[BatchType],
+            batch_iter: Union[Iterator[BatchType], clu.data.DatasetIterator],
             num_steps: int,
             start_step: Optional[int] = None) -> ArrayMapFuture:
     """Runs the train loop for the given number of steps."""
@@ -672,9 +646,10 @@ def accumulate_grads_microbatched(
       (_, metrics), grad_accum = grad_fn(train_state.params, batch, dropout_rng)
       flax_mutables = None
     else:
-      (_, metrics, flax_mutables), grad_accum = grad_fn(train_state.params,
-                                                        batch, dropout_rng,
-                                                        initial_flax_mutables)
+      (_, (metrics,
+           flax_mutables)), grad_accum = grad_fn(train_state.params, batch,
+                                                 dropout_rng,
+                                                 initial_flax_mutables)
   else:
     assert batch_size % num_microbatches == 0, (
         "Batch size isn't divided evenly by num_microbatches.")
@@ -697,7 +672,7 @@ def accumulate_grads_microbatched(
       dropout_rng, sub_dropout_rng = jax.random.split(dropout_rng)
       mbatch = get_microbatch(batch, loop_cnt)
       # We need to annotate the microbatch sharding as we would a batch.
-      mbatch = jax.tree_map(
+      mbatch = jax.tree_util.tree_map(
           lambda x: partitioning.with_sharding_constraint(  # pylint: disable=g-long-lambda
               x, data_partition_spec),
           mbatch)
@@ -705,9 +680,9 @@ def accumulate_grads_microbatched(
         (_, metrics), grad = grad_fn(train_state.params, mbatch,
                                      sub_dropout_rng)
       else:
-        (_, metrics, flax_mutables), grad = grad_fn(train_state.params, mbatch,
-                                                    sub_dropout_rng,
-                                                    flax_mutables)
+        (_, (metrics, flax_mutables)), grad = grad_fn(train_state.params,
+                                                      mbatch, sub_dropout_rng,
+                                                      flax_mutables)
       return metrics, grad, flax_mutables
 
     def per_microbatch_train_step(
@@ -720,7 +695,7 @@ def accumulate_grads_microbatched(
       metrics, grad, flax_mutables = metrics_and_grad(loop_cnt, dropout_rng,
                                                       flax_mutables)
 
-      grad_accum = jax.tree_multimap(jnp.add, grad_accum, grad)
+      grad_accum = jax.tree_util.tree_map(jnp.add, grad_accum, grad)
       metrics = jax.lax.cond(loop_cnt == 0, lambda _: metrics,
                              lambda _: merge_metrics(prev_metrics, metrics),
                              None)
@@ -728,8 +703,8 @@ def accumulate_grads_microbatched(
 
     # Initialize gradient accumulation loop state.
     accum_dtype = jnp.float32
-    grad_accum_init = jax.tree_map(lambda x: jnp.zeros(x.shape, accum_dtype),
-                                   train_state.params)
+    grad_accum_init = jax.tree_util.tree_map(
+        lambda x: jnp.zeros(x.shape, accum_dtype), train_state.params)
     initial_metrics_shape, _, _ = jax.eval_shape(
         metrics_and_grad, loop_cnt=0, dropout_rng=dropout_rng)
 
@@ -816,6 +791,17 @@ def train_with_lr(
       if flax_mutables else None)
 
   return new_train_state, metrics
+
+
+class BaseTrainerConstructor(Protocol):
+  """A function that returns a BaseTrainer."""
+
+  def __call__(self, model: models.BaseModel,
+               train_state: train_state_lib.TrainState,
+               partitioner: partitioning.BasePartitioner,
+               eval_names: Sequence[str], summary_dir: Optional[str],
+               train_state_axes: Any, rng: Rng) -> BaseTrainer:
+    ...
 
 
 class Trainer(BaseTrainer):
@@ -954,9 +940,8 @@ class EarlyStoppingAction(BaseAction):
         not improve for a number of times (specified in patience), stop the
         training. The tuple takes 2 strings, whereas the first string defines
         the task to track, and the second defines the metric of the task to
-        track.
-        e.g.,: ('mt5_xnli_dev_test.all_langs', 'accuracy') would monitor the
-          'accuracy' for `mt5_xnli_dev_test.all_langs`.
+        track. e.g.,: ('mt5_xnli_dev_test.all_langs', 'accuracy') would monitor
+        the 'accuracy' for `mt5_xnli_dev_test.all_langs`.
       mode: One of `{"min", "max"}`. In `min` mode, training will stop when the
         quantity monitored has stopped decreasing; in `"max"` mode it will stop
         when the quantity monitored has stopped increasing;
@@ -967,9 +952,9 @@ class EarlyStoppingAction(BaseAction):
         improvement.
       rtol: Relative tolerance in the monitoried quantity to qualify as an
         improvement. This combined with `atol` defines whether a change is
-        considered improvement.
-        The total change is calculated as following: `delta = (atol + rtol *
-          previous)` See `numpy.allclose` for detailed information.
+        considered improvement. The total change is calculated as following:
+        `delta = (atol + rtol * previous)` See `numpy.allclose` for detailed
+        information.
     """
     self._task, self._metric = metric
     if mode not in ["min", "max"]:

@@ -21,7 +21,6 @@ from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
-from jax._src import api
 from jax.experimental import host_callback as hcb
 import jax.numpy as jnp
 import numpy as np
@@ -35,9 +34,8 @@ class DecodeTest(parameterized.TestCase):
 
   def test_temperature_sample_uneven_prefix(self):
 
-    def token_to_logits(ids, cache):
-      del ids
-      del cache
+    def token_to_logits(decoding_state: decoding.DecodingState):
+      del decoding_state
       # Always sample id 2 for batch element 0 and id 3 for element 1.
       logits = np.array([[-1e7, -1e7, 0, -1e7], [-1e7, -1e7, -1e7, 0]],
                         dtype=np.float32)
@@ -57,7 +55,8 @@ class DecodeTest(parameterized.TestCase):
   def test_temperature_sample_no_prefix(self):
     batch, max_decode_len = 2, 3
 
-    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
+    def token_to_logits(decoding_state: decoding.DecodingState):
+      del decoding_state
       # Always sample id 2 for batch element 0 and id 3 for element 1.
       logits = np.array([[-1e7, -1e7, 0, -1e7], [-1e7, -1e7, -1e7, 0]],
                         dtype=np.float32)
@@ -72,7 +71,8 @@ class DecodeTest(parameterized.TestCase):
 
   def test_temperature_sample_prefix(self):
 
-    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
+    def token_to_logits(decoding_state: decoding.DecodingState):
+      del decoding_state
       # Always sample id 2 for batch element 0 and id 3 for element 1.
       logits = np.array([[-1e7, -1e7, 0, -1e7], [-1e7, -1e7, -1e7, 0]],
                         dtype=np.float32)
@@ -89,7 +89,8 @@ class DecodeTest(parameterized.TestCase):
   def test_temperature_sample_with_zero_temperature(self):
     batch, max_decode_len = 2, 3
 
-    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
+    def token_to_logits(decoding_state: decoding.DecodingState):
+      del decoding_state
       # Use very large logits that are close to one another.
       logits = np.array(
           [[1700.47, 1700.48, 1700.51, 1700.45], [3.2, 4.8, -5.3, 5.6]],
@@ -110,7 +111,8 @@ class DecodeTest(parameterized.TestCase):
 
   def test_temperature_sample_prefix_ending_with_eos(self):
 
-    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
+    def token_to_logits(decoding_state: decoding.DecodingState):
+      del decoding_state
       # Always sample id 2 for batch element 0 and id 3 for element 1.
       logits = np.array([[-1e7, -1e7, 0, -1e7], [-1e7, -1e7, -1e7, 0]],
                         dtype=np.float32)
@@ -127,14 +129,14 @@ class DecodeTest(parameterized.TestCase):
 
   def test_temperature_sample_with_state_callback(self):
 
-    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
+    def token_to_logits(decoding_state: decoding.DecodingState):
+      del decoding_state
       # A distribution with roughly all probability mass in sample id 3
       logits = np.array([[-1e7, -1e7, -1e7, 0], [-1e7, -1e7, -1e7, 0]],
                         dtype=np.float32)
       return logits, {}
 
     def state_callback_fn(state):
-      i, sequences, cache, cur_token, ended, rng, log_prob = state
 
       def callback_fn(current_index_and_sequences):
         """Add EOS token after first time token id 3 has been sampled."""
@@ -146,9 +148,10 @@ class DecodeTest(parameterized.TestCase):
         return sequences
 
       sequences = hcb.call(
-          callback_fn, (i, sequences),
-          result_shape=api.ShapeDtypeStruct(sequences.shape, sequences.dtype))
-      return i, sequences, cache, cur_token, ended, rng, log_prob
+          callback_fn, (state.cur_index, state.sequences),
+          result_shape=jax.ShapeDtypeStruct(state.sequences.shape,
+                                            state.sequences.dtype))
+      return state.replace(sequences=sequences)
 
     inputs = np.array([[0, 5, 6, 7, 0], [0, 8, 9, 0, 0]], dtype=np.int32)
     sampled_sequences, _ = decoding._temperature_sample_single_trial(
@@ -165,7 +168,8 @@ class DecodeTest(parameterized.TestCase):
 
   def test_temperature_sample_with_logit_callback(self):
 
-    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
+    def token_to_logits(decoding_state: decoding.DecodingState):
+      del decoding_state
       # uniform distribution over targets from model
       logits = np.array([[-1e7, -1e7, -1e7, -1e7], [-1e7, -1e7, -1e7, -1e7]],
                         dtype=np.float32)
@@ -218,7 +222,8 @@ class DecodeTest(parameterized.TestCase):
       # `k` at this point is equal to the while loop variable `i` of the caller.
       return ret[k]
 
-    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
+    def token_to_logits(decoding_state: decoding.DecodingState):
+      del decoding_state
       # These values are not used in this test because random.categorical is
       # directly mocked.
       dummy_logits = np.zeros((batch, 4), dtype=np.float32)
@@ -235,7 +240,8 @@ class DecodeTest(parameterized.TestCase):
 
   def test_greedy_decoding_topk_sample_log_probs(self):
 
-    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
+    def token_to_logits(decoding_state: decoding.DecodingState):
+      del decoding_state
       # Sample [2, 3] with probability [0.6, 0.4].
       logits = np.array([[-1e7, -1e7, -0.510825624, -0.916290732]],
                         dtype=np.float32)
@@ -296,7 +302,7 @@ class DecodeTest(parameterized.TestCase):
       return ret[k]
 
     logits = np.random.randn(batch, 4)
-    token_to_logits = lambda ids, cache: (logits, {})
+    token_to_logits = lambda decoding_state: (logits, {})
     inputs = np.array([[0, 5, 1, 0, 0, 0, 0], [0, 8, 0, 0, 0, 0, 0]],
                       dtype=np.int32)
     with mock.patch.object(jax.random, 'categorical', new=mocked_categorical):
@@ -702,8 +708,8 @@ class DecodeTest(parameterized.TestCase):
         }
     }
 
-    jax.tree_multimap(np.testing.assert_array_equal,
-                      decoding.cache_map(fn, cache), gold_cache)
+    jax.tree_map(np.testing.assert_array_equal, decoding.cache_map(fn, cache),
+                 gold_cache)
 
   def test_cache_map_with_index(self):
     cache = {
@@ -764,9 +770,8 @@ class DecodeTest(parameterized.TestCase):
         },
     }
 
-    jax.tree_multimap(np.testing.assert_array_equal,
-                      decoding.cache_map(fn, cache, apply_to_index=True),
-                      gold_cache)
+    jax.tree_map(np.testing.assert_array_equal,
+                 decoding.cache_map(fn, cache, apply_to_index=True), gold_cache)
 
   def test_beam_search(self):
     # Toy problem, we have 4 states, A, B, START, END, (plus PAD).
@@ -814,8 +819,10 @@ class DecodeTest(parameterized.TestCase):
     edge_potentials = jnp.expand_dims(edge_potentials, axis=0)
 
     def tokens_to_logits(
-        token_indices: jnp.ndarray, state_cache: Mapping[str, jnp.ndarray]
+        decoding_state: decoding.DecodingState
     ) -> Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]:
+      token_indices = decoding_state.cur_token
+      state_cache = decoding_state.cache
       cur_iter = state_cache['cur_iter']
       # grab edge potentials for the current timestep
       cur_edge_potentials = jnp.take_along_axis(
@@ -868,7 +875,8 @@ class DecodeTest(parameterized.TestCase):
   def test_beam_search_force_decode_prefix(self):
     beam_size = 2
 
-    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
+    def token_to_logits(decoding_state: decoding.DecodingState):
+      del decoding_state
       # Use id 2 then 3 for batch element 0 and id 3 then 2 for element 1.
       logits = np.repeat(
           np.expand_dims(
@@ -915,7 +923,8 @@ class DecodeTest(parameterized.TestCase):
   def test_beam_search_force_decode_no_prefix(self):
     beam_size = 2
 
-    def token_to_logits(ids, cache):  # pylint: disable=unused-argument
+    def token_to_logits(decoding_state: decoding.DecodingState):
+      del decoding_state
       # Use id 2 then 3 for batch element 0 and id 3 then 2 for element 1.
       logits = np.repeat(
           np.expand_dims(

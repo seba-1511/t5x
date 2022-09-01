@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """General utility functions for t5x."""
+import collections
 import collections.abc
 from concurrent.futures import thread
 import contextlib
@@ -24,21 +25,23 @@ import os
 import re
 import time
 import typing
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple, Type, Union
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple, Type, Union, Protocol
 import warnings
 
 from absl import logging
+import clu.data
 from flax import traverse_util
 import flax.core
 from flax.core import scope as flax_scope
 from flax.linen import partitioning as flax_partitioning
 import jax
-from jax import prng
 from jax import pxla
+from jax.experimental import global_device_array as gda_lib
 from jax.experimental import multihost_utils
 from jax.experimental.global_device_array import GlobalDeviceArray
 import jax.numpy as jnp
 import numpy as np
+import orbax.checkpoint
 import seqio
 from t5x import checkpoints
 from t5x import optimizers
@@ -51,7 +54,7 @@ import typing_extensions
 
 
 Array = Union[np.ndarray, jnp.ndarray, jax.pxla.ShardedDeviceArray, tf.Tensor]
-PyTreeDef = type(jax.tree_structure(None))
+PyTreeDef = type(jax.tree_util.tree_structure(None))
 PartitionSpec = partitioning.PartitionSpec
 DType = Union[np.dtype, type(jnp.bfloat16)]
 Shape = Tuple[int, ...]
@@ -59,11 +62,60 @@ Shape = Tuple[int, ...]
 # TODO(adarob): Remove namespace mapping after client gin files are updated.
 TensorBoardLogger = seqio.TensorBoardLogger
 
+
+class EvaluatorConstructor(Protocol):
+  """A function that returns an Evaluator.
+
+  This protocol represents the actual callsite for the seqio.Evaluator c'tor
+  in this file. It allows users to bind additional args with partial() and
+  pass that partial into the fn without causing type check issues.
+  """
+
+  def __call__(
+      self,
+      mixture_or_task_name: str,
+      feature_converter: seqio.FeatureConverter,
+      eval_split: str,
+      use_cached: bool,
+      seed: Optional[int],
+      sequence_length: Optional[Mapping[str, int]],
+      log_dir: Optional[str],
+      use_memory_cache: bool,
+  ) -> seqio.Evaluator:
+    """The call for the seqio.Evaluator c'tor in this file.
+
+    Args:
+      mixture_or_task_name: a registered task or mixture name.
+      feature_converter: a feature converter object to use to convert the task
+        features to model features. Must be a subclass of
+        seqio.FeatureConverter.
+      eval_split: evaluation split. Typically "validation" or "test".
+      use_cached: whether to use the cached dataset instead of processing it on
+        the fly.
+      seed: random seed used for dataset shuffle and preprocessing. This is
+        usually not needed since eval datasets aren't shuffled and shouldn't use
+        stochastic operations. It is only useful for in certain data sources
+        such as `FewshotDataSource` where the training examples are randomly
+        selected during evaluation.
+      sequence_length: an optional length specification. If specified, these
+        will be the hard-limit on the evaluation data used for prediction. If
+        none of the preprocessors depend on the sequence length, it can be left
+        unspecified and the maximum length for each feature will be used. These
+        lengths are computed while caching the datasets.
+      log_dir: the directory to log outputs to. Required if `logger_cls` is
+        non-empty.
+      use_memory_cache: whether to use tf.data.Dataset#cache. May cause memory
+        issues for large datasets.
+
+    Returns:
+      A seqio.Evaluator.
+    """
+    ...
+
+
 # -----------------------------------------------------------------------------
 # Configurations
 # -----------------------------------------------------------------------------
-
-
 @dataclasses.dataclass
 class SaveCheckpointConfig:
   """Configuration for saving model checkpoints."""
@@ -73,18 +125,23 @@ class SaveCheckpointConfig:
   period: Optional[int] = None
   # Number of most recent checkpoints to keep, or None to keep them all.
   keep: Optional[int] = None
+  # Number of dataset checkpoints to keep, or None to keep them all.
+  # Note: Dataset checkpoints are also affected by `keep`.
+  keep_dataset_checkpoints: Optional[int] = None
   # Whether to save dataset checkpoints.
   save_dataset: bool = False
   # The checkpointer class to use.
-  checkpointer_cls: Type[checkpoints.Checkpointer] = checkpoints.Checkpointer
+  checkpointer_cls: checkpoints.CheckpointerConstructor = checkpoints.Checkpointer
   # Transformations to apply, in order, to the state before writing.
   state_transformation_fns: Sequence[checkpoints.SaveStateTransformationFn] = (
       dataclasses.field(default_factory=list))
+  # Enable GDA in this Checkpointer.
+  use_gda: bool = False
 
   def __post_init__(self):
-    if self.dtype not in ('float32', 'bfloat16'):
+    if self.dtype not in (None, 'float32', 'bfloat16'):
       raise ValueError(
-          "`SaveCheckpointConfig.dtype` must be one of 'float32' or "
+          "`SaveCheckpointConfig.dtype` must be one of None, 'float32' or "
           f"'bfloat16'. Got {self.dtype}.")
 
 
@@ -114,11 +171,13 @@ class RestoreCheckpointConfig:
   # Whether to restore the dataset checkpoint. Fails if checkpoint not present.
   restore_dataset: bool = False
   # The checkpointer class to use.
-  checkpointer_cls: Type[checkpoints.Checkpointer] = checkpoints.Checkpointer
+  checkpointer_cls: checkpoints.CheckpointerConstructor = checkpoints.Checkpointer
   # Transformations to apply, in order, to the state after reading. These will
   # be applied after the `assignment_map` transformations.
   state_transformation_fns: Sequence[
       checkpoints.RestoreStateTransformationFn] = ()
+  # Enable GDA in this Checkpointer.
+  use_gda: bool = False
 
   def __post_init__(self):
     if self.mode not in ('specific', 'latest', 'all'):
@@ -145,13 +204,208 @@ class CheckpointConfig:
   restore: Optional[RestoreCheckpointConfig] = None
 
 
+class LegacyCheckpointer(orbax.checkpoint.Checkpointer):
+  """Implementation of Checkpointer interface for T5X.
+
+  Relies on underlying save_checkpointer and restore_checkpointer, which are
+  t5x.checkpoints.Checkpointer objects.
+  """
+
+  def __init__(self,
+               *,
+               save_checkpointer: Optional[checkpoints.Checkpointer] = None,
+               restore_checkpointer: checkpoints.Checkpointer,
+               strict: Optional[bool] = False):
+    self._save_checkpointer = save_checkpointer
+    self._restore_checkpointer = restore_checkpointer
+    self._strict = strict
+
+  def save(self,
+           path: str,
+           item: train_state_lib.TrainState,
+           state_transformation_fns: Sequence[
+               checkpoints.SaveStateTransformationFn] = (),
+           *,
+           concurrent_gb: int = 128):
+    """Performs save operation using save_checkpointer.
+
+    Args:
+      path: path to save item to.
+      item: a TrainState PyTree to save.
+      state_transformation_fns: Transformations to apply, in order, to the state
+        before writing.
+      concurrent_gb: the approximate number of gigabytes of partitionable
+        parameters to process in parallel. Useful to preserve RAM.
+    """
+    train_state = item
+    del path  # stored in save_checkpointer
+    # dataset_iterator is also saved, but is provided in checkpointer init
+    if self._save_checkpointer is None:
+      raise ValueError(
+          "`_save_checkpointer` is not set up. Can't save checkpoints.")
+    self._save_checkpointer.save(
+        train_state, state_transformation_fns, concurrent_gb=concurrent_gb)
+
+  def restore(self,
+              path: str,
+              item: Optional[train_state_lib.TrainState],
+              state_transformation_fns: Sequence[
+                  checkpoints.RestoreStateTransformationFn] = (),
+              fallback_state: Optional[Mapping[str, Any]] = None,
+              lazy_parameters: bool = False) -> train_state_lib.TrainState:
+    """Performs restore operation using restore_checkpointer.
+
+    Determines whether the indicated path is a Tensorflow checkpoint.
+
+    Args:
+      path: the string path to restore from.
+      item: a TrainState PyTree to restore. Unused.
+      state_transformation_fns: Transformations to apply, in order, to the state
+        before writing.
+      fallback_state: a state dict of an optimizer to fall back to for loading
+        params that do not exist in the checkpoint (after applying all
+        `state_transformation_fns`), but do exist in `Checkpointer.optimizer`.
+        The union of `fallback_state` and state loaded from the checkpoint must
+        match `Checkpointer.optimizer`.
+      lazy_parameters: whether to load the parameters as LazyArrays to preserve
+        memory.
+
+    Returns:
+      The restored train state.
+    """
+    del item  # not needed for restore in T5X
+    from_tensorflow = gfile.exists(path + '.index')
+    if from_tensorflow and state_transformation_fns:
+      raise ValueError('Cannot initialize from a TensorFlow checkpoint using '
+                       '`state_transformation_fns`.')
+    if from_tensorflow:
+      logging.info('Initializing parameters from TensorFlow checkpoint %s',
+                   path)
+      return self._restore_checkpointer.restore_from_tf_checkpoint(
+          path, strict=self._strict)
+    return self._restore_checkpointer.restore(
+        path=path,
+        state_transformation_fns=state_transformation_fns,
+        fallback_state=fallback_state,
+        lazy_parameters=lazy_parameters)
+
+
+class LegacyCheckpointManager(orbax.checkpoint.CheckpointManager):
+  """Implementation of CheckpointManager interface for T5X.
+
+  Uses underlying LegacyCheckpointer to handle save/restore for Dataset and
+  TrainState.
+  """
+
+  def __init__(self,
+               *,
+               save_cfg: Optional[SaveCheckpointConfig] = None,
+               restore_cfg: RestoreCheckpointConfig,
+               train_state_shape: train_state_lib.TrainState,
+               partitioner: partitioning.BasePartitioner,
+               ds_iter: Optional[Union[tf.data.Iterator,
+                                       clu.data.DatasetIterator]] = None,
+               model_dir: Optional[str] = None,
+               use_gda: Optional[bool] = False):
+    if save_cfg is not None:
+      if save_cfg.save_dataset:
+        assert ds_iter is not None
+      save_checkpointer = save_cfg.checkpointer_cls(
+          train_state=train_state_shape,
+          partitioner=partitioner,
+          checkpoints_dir=model_dir,
+          dataset_iterator=ds_iter if save_cfg.save_dataset else None,
+          save_dtype=save_cfg.dtype,
+          keep=save_cfg.keep,
+          use_gda=save_cfg.use_gda,
+          keep_dataset_checkpoints=save_cfg.keep_dataset_checkpoints)
+    else:
+      save_checkpointer = None
+
+    if restore_cfg:
+      restore_checkpointer = restore_cfg.checkpointer_cls(
+          train_state=train_state_shape,
+          partitioner=partitioner,
+          checkpoints_dir='',  # unused for restore
+          dataset_iterator=ds_iter if restore_cfg.restore_dataset else None,
+          restore_dtype=jnp.dtype(restore_cfg.dtype)
+          if restore_cfg.dtype else None,
+          use_gda=use_gda and restore_cfg.use_gda)
+      strict = restore_cfg.strict
+    else:
+      restore_checkpointer = None
+      strict = False
+
+    self._checkpointer = LegacyCheckpointer(
+        save_checkpointer=save_checkpointer,
+        restore_checkpointer=restore_checkpointer,
+        strict=strict)
+
+  def save(self,
+           train_state: train_state_lib.TrainState,
+           state_transformation_fns: Sequence[
+               checkpoints.SaveStateTransformationFn] = ()):
+    """Performs save operation.
+
+    Args:
+      train_state: a TrainState PyTree to save.
+      state_transformation_fns: Transformations to apply, in order, to the state
+        before writing.
+    """
+    self._checkpointer.save(
+        path='',  # not used
+        item=train_state,
+        state_transformation_fns=state_transformation_fns)
+
+  def restore(
+      self,
+      paths: Sequence[str],
+      restore_cfg: RestoreCheckpointConfig,
+      fallback_state: Optional[Mapping[str, Any]] = None
+  ) -> Union[train_state_lib.TrainState, Sequence[train_state_lib.TrainState]]:
+    """Performs restore operation using restore_checkpointer.
+
+    Determines whether the indicated path is a Tensorflow checkpoint.
+
+    Args:
+      paths: A sequence of paths to restore from.
+      restore_cfg: RestoreCheckpointConfig specifying restoration information.
+      fallback_state: a state dict of an optimizer to fall back to for loading
+        params that do not exist in the checkpoint (after applying all
+        `state_transformation_fns`), but do exist in `Checkpointer.optimizer`.
+        The union of `fallback_state` and state loaded from the checkpoint must
+        match `Checkpointer.optimizer`.
+
+    Returns:
+      The restored TrainState if only one TrainState can be restored from the
+      given paths, otherwise a sequence of TrainStates.
+    """
+    if restore_cfg is None or paths is None:
+      return None
+
+    restored = []
+    for path in paths:
+      logging.info('Initializing parameters from specific T5X checkpoint %s',
+                   path)
+      restored.append(
+          self._checkpointer.restore(
+              path=path,
+              item=None,  # not used
+              state_transformation_fns=restore_cfg.state_transformation_fns,
+              fallback_state=fallback_state))
+
+    if len(restored) == 1:
+      restored = restored[0]
+    return restored
+
+
 @dataclasses.dataclass
 class DatasetConfig:
   """Configuration for loading a dataset from a SeqIO Task or Mixture."""
   mixture_or_task_name: str
   task_feature_lengths: Mapping[str, int]
   split: str
-  batch_size: int
+  batch_size: int  # Number of examples per batch.
   shuffle: bool
   seed: Optional[int]
   # Whether to use a precomputed version of the dataset from a cache dir.
@@ -164,6 +418,138 @@ class DatasetConfig:
   module: Optional[str] = None
   # Whether to cache the dataset in memory (only applies to evaluation data).
   use_memory_cache: bool = True
+  # Whether to trim output features from tasks.
+  trim_output_features: bool = True
+
+
+def _get_index_mappings(device_to_idxs):
+  """Get device and host to index set mappings for GDA construction."""
+  idx_to_devices = collections.defaultdict(set)
+  host_to_idx_set = collections.defaultdict(set)
+  for d, idx in device_to_idxs.items():
+    host_to_idx_set[d.process_index].add(gda_lib._hashed_index(idx))  # pylint: disable=protected-access
+    idx_to_devices[gda_lib._hashed_index(idx)].add(d)  # pylint: disable=protected-access
+
+  assert jax.process_index() in host_to_idx_set
+  for h1, set1 in host_to_idx_set.items():
+    for h2, set2 in host_to_idx_set.items():
+      if h1 == h2:
+        continue
+      assert not (set1 & set2) or set1 == set2
+
+  return host_to_idx_set, idx_to_devices
+
+
+def _create_gda(partitioner: partitioning.BasePartitioner,
+                global_shapes: PyTreeDef, host_arrays: PyTreeDef) -> PyTreeDef:
+  """Create GDA from input arrays.
+
+  Example:
+
+  Consider a case where the global input array has length 128. The global mesh
+  specifies that the data dimension be sharded into 8 shards. This means we want
+  shards of length 16. The data_layout, defined by the partitioner object,
+  specifies that the data should be divided into two shards, one per host. Each
+  host will have a local slice of the data (length 64).
+
+  In this function, we will divide the local array into 4 shards of length 16.
+  Each of these will be placed onto a separate device. If the sharding had
+  specified only 4 global shards instead of 8, we would have divided our local
+  array into only 2 shards. In this case, the first shard would be placed on the
+  first two devices (replicated) and the second on the following two devices.
+
+  Args:
+    partitioner: Partitioner object containing mesh and mesh_axes
+    global_shapes: PyTree matching host_arrays specifying global shape of each
+      array.
+    host_arrays: PyTree of LOCAL arrays (not global) that should be converted to
+      GDA.
+
+  Returns:
+    PyTree matching host_arrays of GDA.
+  """
+  global_mesh = partitioner.mesh
+  axes = partitioner.data_partition_spec
+  local_devices = global_mesh.local_devices
+  local_device_count = jax.local_device_count()
+
+  # Global input array is already split into per-host shards.
+  def _put_to_devices(x, global_shape):
+    # Mapping of device to index slice from *global* array.
+    device_to_idxs = gda_lib.get_shard_indices(global_shape, global_mesh, axes)
+    # Mapping of host to a set of unique index slices for that host.
+    # Mapping of index slice to a list of devices onto which the slice should be
+    # placed.
+    host_to_idx_set, idx_to_devices = _get_index_mappings(device_to_idxs)
+
+    shard_length = gda_lib.get_shard_shape(global_shape, global_mesh, axes)[0]
+    num_shards = len(x) // shard_length
+    try:
+      local_array_shards = np.split(x, num_shards, axis=0)
+    except ValueError as array_split_error:
+      raise ValueError(
+          f'Unable to put to devices shape {x.shape} with '
+          f'local device count {local_device_count}') from array_split_error
+
+    # Construct mapping of device to index in the split local array.
+    device_to_split_array_idx = {}
+    i = 0
+    for _, idx_set in host_to_idx_set.items():
+      for idx in idx_set:
+        for d in idx_to_devices[idx]:
+          device_to_split_array_idx[d] = i % len(local_array_shards)
+        i += 1
+
+    device_buffers = []
+    for d in local_devices:
+      i = device_to_split_array_idx[d]
+      device_buffers.append(jax.device_put(local_array_shards[i], d))
+
+    return device_buffers
+
+  device_buffers = jax.tree_map(_put_to_devices, host_arrays, global_shapes)
+
+  def _gda(dbs, global_shape):
+    return GlobalDeviceArray(global_shape, global_mesh, axes, dbs)
+
+  return jax.tree_map(
+      _gda,
+      device_buffers,
+      global_shapes,
+      is_leaf=lambda x: isinstance(x, (list, tuple)))
+
+
+class GDADatasetIterator(clu.data.DatasetIterator):
+  """A wrapper iterator that returns GDA when the next element is requested."""
+
+  def __init__(self, iterator: clu.data.DatasetIterator,
+               partitioner: partitioning.BasePartitioner,
+               global_shapes: PyTreeDef):
+    self._iterator = iterator
+    self._global_shapes = global_shapes
+    self._partitioner = partitioner
+
+  def get_next(self):
+    return _create_gda(self._partitioner, self._global_shapes,
+                       self._iterator.get_next())
+
+  def reset(self):
+    return self._iterator.reset()
+
+  @property
+  def element_spec(self):
+    return self._iterator.element_spec
+
+  def save(self, filename):
+    return self._iterator.save(filename)
+
+  def load(self, filename):
+    return self._iterator.load(filename)
+
+  @property
+  def iterator(self):
+    return self._iterator.iterator if isinstance(
+        self._iterator, clu.data.TfDatasetIterator) else self._iterator
 
 
 #------------------------------------------------------------------------------
@@ -192,16 +578,7 @@ def _hardware_bernoulli(
 
 
 def set_hardware_rng_ops():
-  """Enable JAX Custom PRNG extension."""
-  jax.config.update('jax_enable_custom_prng', True)
-  # Use only fast TPU hardware PRNG with iterated-hash "split" substitute.
-  # Expected to be deterministic for a fixed partitioning.
-  # Monkey-patch JAX PRNGKey to use unsafe_rbg_prng_impl
-  # TODO(levskaya): replace with jax global config option once we debug it.
-  rbg_prng_key = functools.partial(prng.seed_with_impl,
-                                   prng.unsafe_rbg_prng_impl)
-  jax.random.PRNGKey = rbg_prng_key
-  jax._src.random.PRNGKey = rbg_prng_key  # pylint: disable=protected-access
+  jax.config.update('jax_default_prng_impl', 'unsafe_rbg')
 
 
 # -----------------------------------------------------------------------------
@@ -313,6 +690,76 @@ def create_learning_rate_scheduler(
   return step_fn
 
 
+def get_first_valid_restore_config_and_paths(
+    restore_cfgs: Sequence[RestoreCheckpointConfig]
+) -> Tuple[Optional[RestoreCheckpointConfig], Sequence[str]]:
+  """Returns first valid restore_cfg and the paths to restore.
+
+  Args:
+    restore_cfgs: a sequence of RestoreCheckpointConfig objects, which should be
+      filtered to determine the first valid object.
+
+  Returns:
+    Tuple of valid RestoreCheckpointConfig and a sequence of paths.
+    If the first config encountered has mode 'specfic', it is immediately
+    returned, along with its specified paths.
+    If the mode is 'all' or 'latest', checks to ensure that there are valid
+    checkpoints at each of the provided paths and filters the returned paths
+    accordingly.
+  """
+  for restore_cfg in restore_cfgs:
+    paths = ([restore_cfg.path]
+             if isinstance(restore_cfg.path, str) else restore_cfg.path)
+    if restore_cfg.mode == 'specific':
+      return restore_cfg, paths
+    elif restore_cfg.mode in ('all', 'latest'):
+      for ckpt_dir in paths:
+        if not gfile.isdir(ckpt_dir):
+          raise ValueError(
+              'Checkpoint path(s) must be valid directories when using '
+              "restore mode 'all' or 'latest'.")
+        # Check if this is a TensorFlow checkpoint dir.
+        tf_ckpt_state = tf.train.get_checkpoint_state(ckpt_dir)
+
+        if tf_ckpt_state:
+          ckpt_paths = tf_ckpt_state.all_model_checkpoint_paths
+        else:
+          ckpt_paths = [
+              os.path.join(ckpt_dir, f'checkpoint_{step}')
+              for step in checkpoints.all_steps(ckpt_dir)
+          ]
+        if not ckpt_paths:
+          logging.info('No checkpoints found in specified directory: %s',
+                       ckpt_dir)
+          continue
+        if restore_cfg.mode == 'latest':
+          logging.info('Using latest T5X checkpoint.')
+          ckpt_paths = ckpt_paths[-1:]
+        return restore_cfg, ckpt_paths
+    else:
+      logging.error('Unsupported checkpoint restore mode: %s', restore_cfg.mode)
+  return None, []
+
+
+def get_fallback_state(restore_cfg: RestoreCheckpointConfig,
+                       init_fn: Callable[[jnp.ndarray], Mapping[str, Any]],
+                       init_rng: jnp.ndarray) -> Optional[Mapping[str, Any]]:
+  """Returns the fallback_state that can be used in restore()."""
+  if restore_cfg is None:
+    return
+  if restore_cfg.fallback_to_scratch:
+    if not restore_cfg.state_transformation_fns:
+      raise ValueError('`state_transformation_fns` must be provided with '
+                       '`fallback_to_scratch`')
+    if init_rng is None:
+      raise ValueError('An `init_rng` must be provided with '
+                       '`fallback_to_scratch`')
+    fallback_state = init_fn(init_rng)
+  else:
+    fallback_state = None
+  return fallback_state
+
+
 class TrainStateInitializer:
   """Helper for initializing partitioned TrainState from checkpoints or scratch.
 
@@ -396,6 +843,7 @@ class TrainStateInitializer:
         out_axis_resources=self.train_state_axes)
     return p_initialize_train_state_fn(init_rng)
 
+  # TODO(b/216650048) deprecate this function and use orbax.
   def from_checkpoints(
       self,
       restore_cfgs: Sequence[RestoreCheckpointConfig],
@@ -428,7 +876,8 @@ class TrainStateInitializer:
           partitioner=self._partitioner,
           checkpoints_dir='',  # unused for restore
           dataset_iterator=ds_iter if cfg.restore_dataset else None,
-          restore_dtype=jnp.dtype(cfg.dtype) if cfg.dtype else None)
+          restore_dtype=jnp.dtype(cfg.dtype) if cfg.dtype else None,
+          use_gda=cfg.use_gda)
 
       from_tensorflow = gfile.exists(path + '.index')
       if from_tensorflow and cfg.state_transformation_fns:
@@ -441,16 +890,8 @@ class TrainStateInitializer:
             path, strict=cfg.strict)
 
       else:
-        if cfg.fallback_to_scratch:
-          if not cfg.state_transformation_fns:
-            raise ValueError('`state_transformation_fns` must be provided with '
-                             '`fallback_to_scratch`')
-          if init_rng is None:
-            raise ValueError('An `init_rng` must be provided with '
-                             '`fallback_to_scratch`')
-          fallback_state = self.from_scratch(init_rng).state_dict()
-        else:
-          fallback_state = None
+        fallback_state = get_fallback_state(
+            cfg, lambda rng: self.from_scratch(rng).state_dict(), init_rng)
 
         logging.info('Initializing parameters from specific T5X checkpoint %s',
                      path)
@@ -459,44 +900,9 @@ class TrainStateInitializer:
             state_transformation_fns=cfg.state_transformation_fns,
             fallback_state=fallback_state)
 
-    for restore_cfg in restore_cfgs:
-      paths = ([restore_cfg.path]
-               if isinstance(restore_cfg.path, str) else restore_cfg.path)
-      if restore_cfg.mode == 'specific':
-        logging.info('Restoring specific checkpoint(s): %s', paths)
-        for path in paths:
-          yield _restore_path(path, restore_cfg)
-        return
-      elif restore_cfg.mode in ('all', 'latest'):
-        for ckpt_dir in paths:
-          if not gfile.isdir(ckpt_dir):
-            raise ValueError(
-                'Checkpoint path(s) must be valid directories when using '
-                "restore mode 'all' or 'latest'.")
-          # Check if this is a TensorFlow checkpoint dir.
-          tf_ckpt_state = tf.train.get_checkpoint_state(ckpt_dir)
-
-          if tf_ckpt_state:
-            ckpt_paths = tf_ckpt_state.all_model_checkpoint_paths
-          else:
-            ckpt_paths = [
-                os.path.join(ckpt_dir, f'checkpoint_{step}')
-                for step in checkpoints.all_steps(ckpt_dir)
-            ]
-          if not ckpt_paths:
-            logging.info('No checkpoints found in specified directory: %s',
-                         ckpt_dir)
-            continue
-          if restore_cfg.mode == 'latest':
-            logging.info('Restoring latest T5X checkpoint.')
-            ckpt_paths = ckpt_paths[-1:]
-          logging.info('Restoring checkpoints for path(s): %s', ckpt_paths)
-          for ckpt_path in ckpt_paths:
-            yield _restore_path(ckpt_path, restore_cfg)
-          return
-      else:
-        raise ValueError(
-            f'Unsupported checkpoint restore mode: {restore_cfg.mode}')
+    restore_cfg, paths = get_first_valid_restore_config_and_paths(restore_cfgs)
+    for path in paths:
+      yield _restore_path(path, restore_cfg)
 
   def from_checkpoint(
       self,
@@ -680,7 +1086,7 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
   Args:
     infer_step: a callable that executes one prediction step. Should not yet be
       partitioned or pmapped.
-    batch_size: the global infer batch size.
+    batch_size: the number of examples in the global infer batch.
     train_state_axes: Partitioning info for the train state object.
     partitioner: partitioner to use.
 
@@ -699,8 +1105,9 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
 
   partitioned_infer_step = partitioner.partition(
       infer_step_with_indices,
-      in_axis_resources=(train_state_axes.params, PartitionSpec('data',), None,
-                         PartitionSpec('data',)),
+      in_axis_resources=(train_state_axes.params,
+                         partitioner.data_partition_spec, None,
+                         partitioner.data_partition_spec),
       out_axis_resources=(None, None))
 
   data_layout = partitioner.get_data_layout(batch_size)
@@ -763,6 +1170,7 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
       batch_indices, batch_result = partitioned_infer_step(
           train_state.params, infer_batch, step_rng, index)
       logging.info('Inference of batch %s done.', index)
+
       # Issue asynchronous copy request which serves as prefetching to the host.
       def _copy_to_host_async(x):
         if isinstance(x, GlobalDeviceArray):
@@ -786,8 +1194,8 @@ def get_infer_fn(infer_step: InferStepCallable, batch_size: int,
     all_inferences = batched_results
 
     # List[B * shard_count, ...] -> [B * shard_count * batch_count, ...]
-    all_inferences = jax.tree_multimap(lambda *args: np.concatenate(args),
-                                       *all_inferences)
+    all_inferences = jax.tree_map(lambda *args: np.concatenate(args),
+                                  *all_inferences)
     all_indices = np.concatenate(all_indices)
 
     all_inferences, all_indices = _remove_padding(all_inferences, all_indices)
@@ -856,7 +1264,7 @@ def import_module(module: str):
       raise RuntimeError(
           'Your Task/Mixture module contains gin configurables that must be '
           'loaded before gin flag parsing. One fix is to add '
-          f"'import {module}' in your gin file.")
+          f"'import {module}' in your gin file.") from e
     raise e
 
 
@@ -918,7 +1326,7 @@ def get_vocabulary(
 def get_dataset(cfg: DatasetConfig,
                 shard_id: int,
                 num_shards: int,
-                feature_converter_cls: Type[seqio.FeatureConverter],
+                feature_converter_cls: Callable[..., seqio.FeatureConverter],
                 num_epochs: Optional[int] = None,
                 continue_from_last_checkpoint: bool = False) -> tf.data.Dataset:
   """Returns a dataset from SeqIO based on a `DatasetConfig`."""
@@ -951,7 +1359,8 @@ def get_dataset(cfg: DatasetConfig,
 
 def get_dataset_inner(cfg: DatasetConfig,
                       shard_info: seqio.ShardInfo,
-                      feature_converter_cls: Type[seqio.FeatureConverter],
+                      feature_converter_cls: Callable[...,
+                                                      seqio.FeatureConverter],
                       seed: Optional[int] = None,
                       num_epochs: Optional[int] = None):
   """Internal fn to load a dataset from SeqIO based on a `DatasetConfig`."""
@@ -972,23 +1381,37 @@ def get_dataset_inner(cfg: DatasetConfig,
       shuffle=cfg.shuffle,
       num_epochs=num_epochs,
       feature_converter=feature_converter_cls(
-          pack=cfg.pack, use_custom_packing_ops=cfg.use_custom_packing_ops),  # pytype: disable=not-instantiable
+          pack=cfg.pack, use_custom_packing_ops=cfg.use_custom_packing_ops),
       shard_info=shard_info,
       use_cached=cfg.use_cached,
-      seed=seed)
+      seed=seed,
+      trim_output_features=cfg.trim_output_features)
   ds = ds.batch(batch_size, drop_remainder=True)
   return ds
 
 
 class GetDatasetCallable(typing_extensions.Protocol):
+  """Interface for a function returning a dataset (iterator)."""
 
-  def __call__(self,
-               cfg: DatasetConfig,
-               shard_id: int,
-               num_shards: int,
-               feature_converter_cls: Callable[..., seqio.FeatureConverter],
-               num_epochs: Optional[int] = None,
-               continue_from_last_checkpoint: bool = True) -> tf.data.Dataset:
+  def __call__(
+      self,
+      cfg: DatasetConfig,
+      shard_id: int,
+      num_shards: int,
+      feature_converter_cls: Callable[..., seqio.FeatureConverter],
+      num_epochs: Optional[int] = None,
+      continue_from_last_checkpoint: bool = True
+  ) -> Union[clu.data.DatasetIterator, tf.data.Dataset]:
+    ...
+
+
+class GetEvalDatasetCallable(typing_extensions.Protocol):
+  """Interface for a function returning a dataset (iterator)."""
+
+  def __call__(
+      self, cfg: DatasetConfig, shard_id: int, num_shards: int, eval_steps: int,
+      feature_converter_cls: Callable[..., seqio.FeatureConverter]
+  ) -> Mapping[str, tf.data.Dataset]:
     ...
 
 
@@ -998,20 +1421,29 @@ def get_training_eval_datasets(
     num_shards: int,
     eval_steps: int,
     feature_converter_cls: Callable[..., seqio.FeatureConverter],
-    get_dataset_fn: GetDatasetCallable = get_dataset,
+    deterministic: bool = False,
+    model_dir: Optional[str] = None,
+    start_step: int = 0,
 ) -> Mapping[str, tf.data.Dataset]:
   """Returns a mapping from eval task name to its dataset."""
   mixture_or_task = seqio.get_mixture_or_task(cfg.mixture_or_task_name)
   datasets = {}
+  get_dataset_fn = get_dataset
+  if deterministic:
+    assert model_dir is not None
+    get_dataset_fn = functools.partial(
+        get_deterministic_dataset, model_dir=model_dir, start_step=start_step)
 
   if cfg.batch_size % num_shards:
     raise ValueError(
         f'Batch size ({cfg.batch_size}) must be divisible by number of '
         f'shards ({num_shards}).')
 
-  def _repeat_shard_batch_take_cache(ds):
+  def _repeat_shard_batch_take_cache(ds: tf.data.Dataset):
     # We shard and batch the full, repeated dataset to avoid issues with uneven
     # file shards.
+    if not isinstance(ds, tf.data.Dataset):
+      raise ValueError('Only tf.data.Dataset objects supported.')
     return ds.unbatch().repeat().shard(num_shards, shard_id).batch(
         cfg.batch_size // num_shards,
         drop_remainder=True).take(eval_steps).cache()
@@ -1138,8 +1570,10 @@ def override_params_axes_names(
 
 
 def get_local_data(x):
+  """Get local buffer for input data."""
   if isinstance(x, GlobalDeviceArray):
-    return x.local_data(0)
+    val = x.local_data(0)
+    return val
   elif isinstance(x, pxla.ShardedDeviceArray):
     val = x.device_buffers[0]
     if val.aval is None:

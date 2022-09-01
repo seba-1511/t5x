@@ -15,12 +15,12 @@
 r"""Script to pretrain or finetune in JAX using a SeqIO pipeline.
 
 """
+
 import functools
-import itertools
 import math
 import os
 import time
-from typing import Callable, Iterator, Sequence, Mapping, Tuple, Type, Optional
+from typing import Callable, Sequence, Mapping, Tuple, Type, Optional
 
 # Set Linen to add profiling information when constructing Modules.
 # Must be set before flax imports.
@@ -30,12 +30,15 @@ os.environ['FLAX_PROFILE'] = 'true'
 os.environ['FLAX_LAZY_RNG'] = 'no'
 from absl import logging
 from clu import metric_writers
+import clu.data
 import jax
 from jax import random
 from jax.experimental import multihost_utils
+from jax.experimental.global_device_array import GlobalDeviceArray
 import jax.numpy as jnp
 import numpy as np
 import seqio
+from t5x import checkpoints
 from t5x import models
 from t5x import partitioning
 from t5x import train_state as train_state_lib
@@ -94,7 +97,7 @@ def train(
     infer_eval_dataset_cfg: Optional[utils.DatasetConfig],
     checkpoint_cfg: utils.CheckpointConfig,
     partitioner: partitioning.BasePartitioner,
-    trainer_cls: Type[trainer_lib.BaseTrainer],
+    trainer_cls: trainer_lib.BaseTrainerConstructor,
     model_dir: str,
     total_steps: int,
     eval_steps: int,
@@ -104,12 +107,15 @@ def train(
     use_hardware_rng: bool = False,
     summarize_config_fn: Callable[[str, metric_writers.MetricWriter, int],
                                   None],
-    inference_evaluator_cls: Type[seqio.Evaluator] = seqio.Evaluator,
+    inference_evaluator_cls: utils.EvaluatorConstructor = seqio.Evaluator,
     get_dataset_fn: utils.GetDatasetCallable = utils.get_dataset,
     concurrent_metrics: bool = True,
     actions: Optional[Mapping[str, Sequence[trainer_lib.BaseAction]]] = None,
-    train_eval_get_dataset_fn: Optional[utils.GetDatasetCallable] = None,
+    train_eval_get_dataset_fn: utils.GetEvalDatasetCallable = utils
+    .get_training_eval_datasets,
     run_eval_before_training: bool = False,
+    train_state_initializer_cls: Type[
+        utils.TrainStateInitializer] = utils.TrainStateInitializer,
     use_gda: bool = False) -> Tuple[int, train_state_lib.TrainState]:
   """Train function.
 
@@ -157,9 +163,11 @@ def train(
       chaining futures and mutating states concurrently might be error-prone.
     train_eval_get_dataset_fn: Optional callable use to get the train-eval
       datasets based on the DatasetConfig and shard information. If missing, it
-      defaults to `get_dataset_fn`.
+      defaults to `utils.get_training_eval_datasets`.
     run_eval_before_training: If True, calculate training eval and inference
       eval metrics before training begins.
+    train_state_initializer_cls: t5x.utils.TrainStateInitializer class for
+      initializing partitioned TrainState from checkpoints or scratch.
     use_gda: if True, uses GlobalDeviceArray. Experimental feature.
 
   Returns:
@@ -214,7 +222,7 @@ def train(
   # ---------------------------------------------------------------------------
 
   if (train_dataset_cfg.seed and
-      not (checkpoint_cfg.save or checkpoint_cfg.save.save_dataset)):
+      not (checkpoint_cfg.save and checkpoint_cfg.save.save_dataset)):
     logging.warning(
         'Providing a random seed for the train dataset with '
         '`checkpoint_train_ds=False` is dangerous since each '
@@ -239,28 +247,38 @@ def train(
 
   train_ds = get_dataset_fn(train_dataset_cfg, ds_shard_id, num_ds_shards,
                             model.FEATURE_CONVERTER_CLS)
+  checkpoint_dataset = False
+  if isinstance(train_ds, tf.data.Dataset):
+    train_iter = clu.data.TfDatasetIterator(train_ds)
+    checkpoint_dataset = True
+  elif isinstance(train_ds, clu.data.DatasetIterator):
+    train_iter = train_ds
+  else:
+    raise ValueError(
+        f'get_dataset_fn returned unsupported type {type(train_ds)}.')
+
+  input_shapes = {
+      k: (data_layout.batch_size, *v.shape[1:])
+      for k, v in train_iter.element_spec.items()
+  }
+  input_types = {
+      k: v.dtype.as_numpy_dtype() for k, v in train_ds.element_spec.items()
+  }
+
+  if use_gda:
+    train_iter = utils.GDADatasetIterator(train_iter, partitioner, input_shapes)
 
   if train_eval_dataset_cfg:
     _verify_matching_vocabs(train_eval_dataset_cfg)
-    train_eval_datasets = utils.get_training_eval_datasets(
-        train_eval_dataset_cfg,
-        ds_shard_id,
-        num_ds_shards,
-        eval_steps,
-        model.FEATURE_CONVERTER_CLS,
-        get_dataset_fn=train_eval_get_dataset_fn if train_eval_get_dataset_fn
-        is not None else get_dataset_fn)  # type: Mapping[str, tf.data.Dataset]
+    train_eval_datasets = train_eval_get_dataset_fn(
+        train_eval_dataset_cfg, ds_shard_id, num_ds_shards, eval_steps,
+        model.FEATURE_CONVERTER_CLS)  # type: Mapping[str, tf.data.Dataset]
     if not train_eval_datasets:
       logging.warning(
           'No train_eval datasets loaded from config `train_eval_dataset_cfg`: '
           '%s', train_eval_dataset_cfg)
   else:
     train_eval_datasets = {}
-
-  # Initialize optimizer, maybe from an existing checkpoint.
-  checkpointable_train_iter: tf.data.Iterator = iter(train_ds)  # pytype:disable=annotation-type-mismatch
-  train_iter: Iterator[trainer_lib.BatchType] = map(
-      lambda x: jax.tree_map(np.asarray, x), checkpointable_train_iter)
 
   # The manner in which parameters are initialized follows this order of
   # preference:
@@ -280,8 +298,9 @@ def train(
       utils.RestoreCheckpointConfig(
           path=model_dir,
           mode='latest',
-          dtype=checkpoint_cfg.save.dtype,
-          checkpointer_cls=checkpoint_cfg.save.checkpointer_cls,
+          dtype=checkpoint_cfg.save.dtype if checkpoint_cfg.save else 'float32',
+          checkpointer_cls=checkpoint_cfg.save.checkpointer_cls
+          if checkpoint_cfg.save else checkpoints.Checkpointer,
           # Restore dataset state if it is being saved.
           restore_dataset=(checkpoint_cfg.save and
                            checkpoint_cfg.save.save_dataset),
@@ -304,24 +323,39 @@ def train(
       raise ValueError(
           'Restore checkpoint config may only have a single path in training.')
 
-  # Need to use full batch size.
-  input_shapes = {
-      k: (data_layout.batch_size, *v.shape[1:])
-      for k, v in train_ds.element_spec.items()
-  }
-  input_types = {
-      k: v.dtype.as_numpy_dtype() for k, v in train_ds.element_spec.items()
-  }
   init_or_restore_tick = time.time()
-  train_state_initializer = utils.TrainStateInitializer(
+  train_state_initializer = train_state_initializer_cls(
       optimizer_def=model.optimizer_def,
       init_fn=model.get_initial_variables,
       input_shapes=input_shapes,
       input_types=input_types,
       partitioner=partitioner)
-  #  3. From scratch using `init_fn`.
-  train_state = train_state_initializer.from_checkpoint_or_scratch(
-      restore_cfgs, init_rng=init_rng, ds_iter=checkpointable_train_iter)
+
+  # May be None, empty
+  valid_restore_cfg, restore_paths = utils.get_first_valid_restore_config_and_paths(
+      restore_cfgs)
+  if len(restore_paths) > 1:
+    raise ValueError('Multiple restore paths not permitted in training.')
+  checkpointable_train_iter = (
+      train_iter.iterator if checkpoint_dataset else None)
+  checkpoint_manager = utils.LegacyCheckpointManager(
+      save_cfg=checkpoint_cfg.save,
+      restore_cfg=valid_restore_cfg,
+      train_state_shape=train_state_initializer.global_train_state_shape,
+      partitioner=partitioner,
+      ds_iter=checkpointable_train_iter,
+      model_dir=model_dir,
+      use_gda=use_gda)
+
+  train_state = checkpoint_manager.restore(
+      restore_paths, valid_restore_cfg,
+      utils.get_fallback_state(
+          valid_restore_cfg,
+          lambda rng: train_state_initializer.from_scratch(rng).state_dict(),
+          init_rng))
+
+  # 3. If no checkpoint to restore, init from scratch.
+  train_state = train_state or train_state_initializer.from_scratch(init_rng)
   train_state_axes = train_state_initializer.train_state_axes
   init_or_restore_secs = time.time() - init_or_restore_tick
   logging.info('Initialize/restore complete (%.2f seconds).',
@@ -333,19 +367,8 @@ def train(
                        train_state_initializer.global_train_state_shape,
                        partitioner)
 
-  if checkpoint_period:
-    checkpointer = checkpoint_cfg.save.checkpointer_cls(
-        train_state=train_state_initializer.global_train_state_shape,
-        partitioner=partitioner,
-        checkpoints_dir=model_dir,
-        dataset_iterator=(checkpointable_train_iter
-                          if checkpoint_cfg.save.save_dataset else None),
-        save_dtype=checkpoint_cfg.save.dtype,
-        keep=checkpoint_cfg.save.keep,
-        use_gda=use_gda)
-
   # Restore step from last checkpoint or set to 0 if training from scratch.
-  host_step = int(utils.get_local_data(train_state.step))
+  host_step = int(utils.get_local_data(train_state.step))  # pytype: disable=attribute-error
 
   # ---------------------------------------------------------------------------
   # Trainer
@@ -484,6 +507,12 @@ def train(
       logging.info('Running inference eval before training.')
       _run_inference_eval()
 
+  # Save checkpoints before the training loop starts.
+  if checkpoint_period:
+    logging.info('Saving checkpoint before the training loop starts.')
+    checkpoint_manager.save(trainer.train_state,
+                            checkpoint_cfg.save.state_transformation_fns)
+
   # ----------------------------------------------------------------------------
   # Main training loop
   # ----------------------------------------------------------------------------
@@ -505,20 +534,26 @@ def train(
   logging.info('Training with artificial "epochs" of %d steps.',
                steps_per_epoch)
 
-  # Kickstart training dataset and compile train loop.
-  logging.info('Kickstarting train dataset prefetch.')
-  logging.flush()
-
-  ds_tick = time.time()
-  # Get first batch to warm up the dataset pipeline.
-  first_batch = next(train_iter)
-  # Prepend first batch back to iterator to be used by trainer.
-  train_iter = itertools.chain([first_batch], train_iter)
-  train_metrics.write_scalar('timing/dataset_warmup_seconds',
-                             time.time() - ds_tick, host_step)
   logging.info('Compiling train loop.')
   logging.flush()
-  trainer.compile_train(first_batch)
+
+  def _as_gda(arr):
+    return GlobalDeviceArray.from_callback(arr.shape, partitioner.mesh,
+                                           partitioner.data_partition_spec,
+                                           lambda idx: arr[idx])
+
+  if use_gda:
+    dummy_batch = {
+        k: np.ones((data_layout.batch_size, *v.shape[1:]), v.dtype)
+        for k, v in train_iter.element_spec.items()
+    }
+    dummy_batch = jax.tree_map(_as_gda, dummy_batch)
+  else:
+    dummy_batch = {
+        k: np.ones(v.shape, v.dtype)
+        for k, v in train_iter.element_spec.items()
+    }
+  trainer.compile_train(dummy_batch)
 
   # Main Loop over "epochs".
   for epoch in range(first_epoch, num_epochs):
@@ -537,9 +572,11 @@ def train(
       logging.info('Training for %d steps.', num_steps)
       while host_step < epoch_end_step:
         if trainer.stop_training:
-          logging.info('Saving a checkpoint before early stopping...')
-          checkpointer.save(trainer.train_state,
-                            checkpoint_cfg.save.state_transformation_fns)
+          if checkpoint_period:
+            logging.info('Saving a checkpoint before early stopping...')
+            checkpoint_manager.save(
+                trainer.train_state,
+                checkpoint_cfg.save.state_transformation_fns)
           logging.info('Stopping training loop early since `stop_training` is '
                        'requested.')
           break
@@ -559,10 +596,11 @@ def train(
         host_step += inner_num_steps
       logging.info('END Train loop.')
     except trainer_lib.PreemptionError as e:
-      logging.info('Saving emergency checkpoint.')
-      checkpointer.save(trainer.train_state,
-                        checkpoint_cfg.save.state_transformation_fns)
-      logging.info('Saving emergency checkpoint done.')
+      if checkpoint_period:
+        logging.info('Saving emergency checkpoint.')
+        checkpoint_manager.save(trainer.train_state,
+                                checkpoint_cfg.save.state_transformation_fns)
+        logging.info('Saving emergency checkpoint done.')
       raise e
 
     step_offset = host_step - first_step
@@ -574,8 +612,8 @@ def train(
       train_summary.result()
       logging.info('Saving checkpoint.')
       checkpoint_tick = time.time()
-      checkpointer.save(trainer.train_state,
-                        checkpoint_cfg.save.state_transformation_fns)
+      checkpoint_manager.save(trainer.train_state,
+                              checkpoint_cfg.save.state_transformation_fns)
       checkpoint_tock = time.time()
       train_metrics.write_scalar('timing/checkpoint_seconds',
                                  checkpoint_tock - checkpoint_tick, host_step)
@@ -644,6 +682,22 @@ if __name__ == '__main__':
       'seqio_additional_cache_dirs', [],
       'Directories to search for cached Tasks in addition to defaults.')
 
+  flags.DEFINE_boolean(
+      'multiprocess_gpu',
+      False,
+      help='Initialize JAX distributed system for multi-host GPU, using '
+      '`coordinator_address`, `process_count`, and `process_index`.')
+
+  flags.DEFINE_string(
+      'coordinator_address',
+      None,
+      help='IP address:port for multi-host GPU coordinator.')
+
+  flags.DEFINE_integer(
+      'process_count', None, help='Number of processes for multi-host GPU.')
+
+  flags.DEFINE_integer('process_index', None, help='Index of this process.')
+
 
 
   def main(argv: Sequence[str]):
@@ -654,6 +708,22 @@ if __name__ == '__main__':
     """True main function."""
     if len(argv) > 1:
       raise app.UsageError('Too many command-line arguments.')
+
+
+    if FLAGS.multiprocess_gpu:
+      if (FLAGS.coordinator_address is None or FLAGS.process_count is None or
+          FLAGS.process_index is None):
+        raise ValueError(
+            '`coordinator_address`, `process_count` and `process_index` '
+            'must be provided alongside `multiprocess_gpu`')
+
+      logging.info(
+          'Initializing distributed system for multi-host GPU:\n'
+          '  coordinator_address: %s\n  process_count: %s\n  process_index: %s',
+          FLAGS.coordinator_address, FLAGS.process_count, FLAGS.process_index)
+
+      jax.distributed.initialize(FLAGS.coordinator_address, FLAGS.process_count,
+                                 FLAGS.process_index)
 
     if FLAGS.tfds_data_dir:
       seqio.set_tfds_data_dir_override(FLAGS.tfds_data_dir)
@@ -669,5 +739,7 @@ if __name__ == '__main__':
         FLAGS.gin_file,
         FLAGS.gin_bindings)
     train_using_gin()
+    jax.effects_barrier()
+
 
   gin_utils.run(main)

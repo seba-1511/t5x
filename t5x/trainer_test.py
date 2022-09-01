@@ -25,6 +25,7 @@ import clu.metrics
 import clu.values
 import flax
 import jax
+from jax._src import dispatch as jax_dispatch
 import jax.numpy as jnp
 import numpy as np
 from t5x import metrics as metrics_lib
@@ -40,6 +41,8 @@ from tensorflow.io import gfile
 mock = absltest.mock
 jax.config.parse_flags_with_absl()
 
+FlaxMutables = flax.core.FrozenDict
+
 
 # Make `log_elapsed_time` a no-op to simplify mocking of `time.time()`.
 @contextlib.contextmanager
@@ -47,7 +50,7 @@ def fake_log_elapsed_time(_):
   yield
 
 
-jax._src.dispatch.log_elapsed_time = fake_log_elapsed_time
+jax_dispatch.log_elapsed_time = fake_log_elapsed_time
 
 
 def _validate_events(test_case, summary_dir, expected_metrics, steps):
@@ -68,8 +71,7 @@ def _validate_events(test_case, summary_dir, expected_metrics, steps):
     else:
       actual_events[event.summary.value[0].tag] = float(tf.make_ndarray(tensor))
 
-  jax.tree_multimap(test_case.assertAlmostEqual, actual_events,
-                    expected_metrics)
+  jax.tree_map(test_case.assertAlmostEqual, actual_events, expected_metrics)
 
 
 class MetricsManagerTest(absltest.TestCase):
@@ -81,24 +83,24 @@ class MetricsManagerTest(absltest.TestCase):
   def test_summary_dir(self):
     # All hosts have the summary dir.
     with mock.patch('jax.process_index', return_value=0):
-      mm = trainer_lib.MetricsManager('eval', lambda x, y: x, self.model_dir)
+      mm = trainer_lib.MetricsManager('eval', self.model_dir)
     self.assertEqual(mm.summary_dir, os.path.join(self.model_dir, 'eval'))
     mm.close()
 
     with mock.patch('jax.process_index', return_value=1):
-      mm = trainer_lib.MetricsManager('eval', lambda x, y: x, self.model_dir)
+      mm = trainer_lib.MetricsManager('eval', self.model_dir)
     self.assertEqual(mm.summary_dir, os.path.join(self.model_dir, 'eval'))
     mm.close()
 
   def test_summary_writer(self):
     # Only host 0 creates a non-empty summary writer.
     with mock.patch('jax.process_index', return_value=1):
-      mm = trainer_lib.MetricsManager('eval', lambda x, y: x, self.model_dir)
+      mm = trainer_lib.MetricsManager('eval', self.model_dir)
     self.assertFalse(gfile.exists(mm.summary_dir))
     mm.close()
 
     with mock.patch('jax.process_index', return_value=0):
-      mm = trainer_lib.MetricsManager('eval', lambda x, y: x, self.model_dir)
+      mm = trainer_lib.MetricsManager('eval', self.model_dir)
     self.assertIsInstance(mm.summary_writer, metric_writers.MetricWriter)
     self.assertTrue(gfile.exists(mm.summary_dir))
     mm.close()
@@ -111,14 +113,14 @@ class MetricsManagerTest(absltest.TestCase):
 
     # Only host 0 has actually writes summaries.
     with mock.patch('jax.process_index', return_value=1):
-      mm = trainer_lib.MetricsManager('eval', lambda x, y: x, self.model_dir)
+      mm = trainer_lib.MetricsManager('eval', self.model_dir)
       for s in scalars:
         mm.write_scalar(*s)
     self.assertEmpty(gfile.listdir(mm.summary_dir))
     mm.close()
 
     with mock.patch('jax.process_index', return_value=0):
-      mm = trainer_lib.MetricsManager('eval', lambda x, y: x, self.model_dir)
+      mm = trainer_lib.MetricsManager('eval', self.model_dir)
       for s in scalars:
         mm.write_scalar(*s)
     mm.flush()
@@ -138,48 +140,6 @@ class MetricsManagerTest(absltest.TestCase):
     mm.close()
 
   def test_write_metrics_summary(self):
-    gfile.makedirs(os.path.join(self.model_dir, 'eval'))
-
-    def summarize_fn(metrics, duration, num_steps):
-      return {
-          'loss': metrics['loss'].compute() / num_steps,
-          'accuracy': metrics['accuracy'].compute() / num_steps,
-          'batches_per_second': num_steps / duration
-      }
-
-    accumulated_metrics = {
-        'loss': metrics_lib.Sum(40.0),
-        'accuracy': metrics_lib.Sum(198.0)
-    }
-    expected_events = {
-        'loss': 20.0,
-        'accuracy': 99.0,
-        'batches_per_second': 0.05
-    }
-
-    # Only host 0 has a summary writer.
-    with mock.patch('jax.process_index', return_value=1):
-      mm = trainer_lib.MetricsManager('eval', summarize_fn, self.model_dir)
-      mm.start_duration_timer()
-      mm.write_metrics_summary(accumulated_metrics, step=4, num_steps=2)
-      mm.flush()
-    self.assertEmpty(gfile.listdir(mm.summary_dir))
-    mm.close()
-
-    with mock.patch(
-        'jax.process_index', return_value=0), mock.patch(
-            'time.time',
-            side_effect=[0, 40]  # start_time, end_time
-        ), mock.patch('absl.logging.log'):  # avoids hidden calls to time.time()
-      mm = trainer_lib.MetricsManager('eval', summarize_fn, self.model_dir)
-      mm.start_duration_timer()
-      mm.write_metrics_summary(accumulated_metrics, step=4, num_steps=2)
-      mm.flush()
-
-    _validate_events(self, mm.summary_dir, expected_events, steps=[4, 4, 4])
-    mm.close()
-
-  def test_write_metrics_summary_no_summarize_fn(self):
     gfile.makedirs(os.path.join(self.model_dir, 'eval'))
 
     @flax.struct.dataclass
@@ -220,7 +180,7 @@ class MetricsManagerTest(absltest.TestCase):
     mm.close()
 
   def test_timer_blocking_on_donated_buffer(self):
-    mm = trainer_lib.MetricsManager('train', lambda x, y: x, summary_dir=None)
+    mm = trainer_lib.MetricsManager('train', summary_dir=None)
     x = jnp.zeros(1)
 
     # Not deleted.
@@ -268,7 +228,7 @@ def fake_apply_grads(optimizer,
   del weight_metrics_computer
   del other_state_variables
   metrics['learning_rate'] = clu.metrics.Average(learning_rate, count=1)
-  optimizer = jax.tree_multimap(lambda x, g: x + g, optimizer, grad_accum)
+  optimizer = jax.tree_map(lambda x, g: x + g, optimizer, grad_accum)
   return optimizer, metrics
 
 
@@ -290,13 +250,13 @@ def fake_eval_fn_without_weight_sum(params, batch):
 
 
 def fake_value_and_grad_fn_without_weight_sum(callable_fn, has_aux=False):
-  del callable_fn, has_aux
+  del callable_fn
 
   def fake_grad_fn_without_weight_sum(train_state_params,
                                       batch,
                                       dropout_rng,
                                       flax_mutables=None):
-    del dropout_rng, train_state_params, flax_mutables
+    del dropout_rng, train_state_params
     # Add `i` to each optimzer value.
     i = batch['i'].sum()
     optimizer = optimizers.Optimizer(
@@ -315,7 +275,16 @@ def fake_value_and_grad_fn_without_weight_sum(callable_fn, has_aux=False):
     # Add j to each metric.
     j = batch['j'].sum()
     metrics = {'loss': metrics_lib.Sum(j), 'accuracy': metrics_lib.Sum(j)}
-    return (None, metrics), grad_accum.params
+
+    if flax_mutables is not None:
+      aux = metrics, flax_mutables
+    else:
+      aux = metrics
+
+    if has_aux:
+      return (None, aux), grad_accum.params
+    else:
+      return None, grad_accum.params
 
   return fake_grad_fn_without_weight_sum
 
@@ -399,8 +368,8 @@ class TrainerTest(parameterized.TestCase):
 
     # Base rng must remain the same
     np.testing.assert_array_equal(trainer._base_rng, initial_rng)
-    jax.tree_multimap(np.testing.assert_equal, trainer.train_state,
-                      expected_train_state)
+    jax.tree_map(np.testing.assert_equal, trainer.train_state,
+                 expected_train_state)
     # Expected step is 6 since we increment it along with the other optimizer
     # values.
     steps = [2, 2, 2]
@@ -942,7 +911,7 @@ def fake_mut_apply_grads(optimizer, grad_accum, metrics, learning_rate,
   del weight_metrics_computer, other_state_variables
   metrics['learning_rate'] = clu.metrics.Average.from_model_output(
       learning_rate)
-  optimizer = jax.tree_multimap(lambda x, g: x + g, optimizer, grad_accum)
+  optimizer = jax.tree_map(lambda x, g: x + g, optimizer, grad_accum)
   return optimizer, metrics
 
 
@@ -962,14 +931,16 @@ class MutableTrainerTest(parameterized.TestCase):
             'kernel': np.zeros((2, 4))
         })
     self.init_train_state = train_state_lib.FlaxOptimTrainState(
-        self.init_optimizer)
+        _optimizer=self.init_optimizer,
+        flax_mutables=FlaxMutables(variables={
+            'keys': np.zeros((10, 2)),
+            'values': np.zeros((10, 5)),
+        }))
     train_state_axes = jax.tree_map(lambda x: None, self.init_train_state)
     model_dir = self.create_tempdir().full_path
 
     mapfn = lambda i: {'i': [tf.cast(i, tf.int32)], 'j': [tf.cast(1, tf.int32)]}
     self.dataset = tf.data.Dataset.range(6).map(mapfn).batch(
-        2, drop_remainder=True)
-    self.dataset1 = tf.data.Dataset.range(6).map(mapfn).batch(
         2, drop_remainder=True)
 
     self.test_trainer = trainer_lib.Trainer(
@@ -1007,11 +978,43 @@ class MutableTrainerTest(parameterized.TestCase):
                                         self.init_train_state)
     # Base rng must remain the same
     np.testing.assert_array_equal(trainer._base_rng, initial_rng)
-    jax.tree_multimap(np.testing.assert_equal, train_state,
-                      expected_train_state)
+    jax.tree_map(np.testing.assert_equal, train_state, expected_train_state)
 
     self.assertIsNone(trainer._compiled_train_step)
     self.assertEqual(trainer._partitioned_train_step.call_count, num_steps)
+
+  @mock.patch('jax.value_and_grad', fake_value_and_grad_fn_without_weight_sum)
+  def test_accumulate_grads_microbatched_without_weight_sum_single_batch(self):
+    batch_iter = self.dataset.as_numpy_iterator()
+    batch = next(batch_iter)
+    num_microbatches = 1
+    grad_accum, metrics, flax_mutables = trainer_lib.accumulate_grads_microbatched(
+        self.test_trainer._model, self.init_train_state, batch,
+        self.test_trainer._base_rng, num_microbatches)
+
+    i = batch['i'].sum()
+    expected_grad_accum = jax.tree_map(lambda x: i,
+                                       self.init_train_state).params
+    self.assertEqual(expected_grad_accum, grad_accum)
+    self.assertEqual(metrics['loss'].compute(), 2)
+    self.assertEqual(metrics['accuracy'].compute(), 2)
+    self.assertIsNotNone(flax_mutables)
+
+  @mock.patch('jax.value_and_grad', fake_value_and_grad_fn_without_weight_sum)
+  def test_accumulate_grads_microbatched_without_weight_sum_multiple_batches(
+      self):
+    batch_iter = self.dataset.as_numpy_iterator()
+    batch = next(batch_iter)
+    num_micro_batches = 2
+    grad_accum, metrics, flax_mutables = trainer_lib.accumulate_grads_microbatched(
+        self.test_trainer._model, self.init_train_state, batch,
+        self.test_trainer._base_rng, num_micro_batches)
+
+    expected_grad_accum = {'bias': jnp.ones(4), 'kernel': jnp.ones((2, 4))}
+    chex.assert_trees_all_equal(expected_grad_accum, grad_accum)
+    self.assertEqual(metrics['loss'].compute(), 2)
+    self.assertEqual(metrics['accuracy'].compute(), 2)
+    self.assertIsNotNone(flax_mutables)
 
   def tearDown(self) -> None:
     # Manually close managers to avoid phantom threads crossing test cases.
