@@ -146,5 +146,5 @@ trainer.Trainer:
   learning_rate_fn = @utils.create_learning_rate_scheduler()
 utils.create_learning_rate_scheduler:
   factors = 'constant'
-  base_learning_rate = 0.001
+  base_learning_rate = 0.05
   warmup_steps = 1000

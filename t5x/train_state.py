@@ -25,6 +25,10 @@ import flax.struct
 import jax.numpy as jnp
 from t5x import optimizers
 
+import jax
+import optax
+import functools
+
 import typing_extensions
 
 EMPTY_DICT = flax.core.freeze({})
@@ -32,6 +36,46 @@ FrozenDict = flax_scope.FrozenDict
 FrozenVariableDict = flax_scope.FrozenVariableDict
 MutableVariableDict = flax_scope.MutableVariableDict
 VariableDict = flax_scope.VariableDict
+
+
+def get_optax_optimizer():
+    return optax.adafactor(
+        learning_rate=0.05,
+        min_dim_size_to_factor=128,
+        decay_rate=0.8,
+        decay_offset=-1000000,
+        multiply_by_parameter_scale=False,
+        clipping_threshold=1.0,
+        momentum=None,
+        weight_decay_rate=1e-5,
+        eps=1e-30,
+        factored=True,
+    )
+
+
+# Has to be on GPU when call from host_callback, else deadlocks
+# when allocating new tensors.
+@functools.partial(jax.jit, backend='cpu')
+def optax_init(params):
+    return OPTAX_OPTIMIZER.init(params)
+
+
+# Has to be on GPU when call from host_callback, else deadlocks
+# when allocating new tensors.
+@functools.partial(jax.jit, backend='cpu')
+def optax_update(prompt, grads, state):
+    optimizer = get_optax_optimizer()
+    update, new_state = optimizer.update(
+        grads,
+        state,
+        prompt,
+    )
+    new_prompt = optax.apply_updates(prompt, update)
+    return new_prompt, new_state
+
+
+OPTAX_OPTIMIZER = get_optax_optimizer()
+OPTAX_STATE = None
 
 
 class TrainState(typing_extensions.Protocol):
@@ -122,6 +166,10 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
   # Contains axis metadata (e.g., names) matching flax_mutables tree.
   flax_mutables_axes: Optional[FrozenVariableDict] = None
 
+  # optax stuff
+  #  optax_optimizer: optax.GradientTransformation = None
+  optax_state: tuple = None
+
   @classmethod
   def create(cls, optimizer_def: optimizers.OptimizerDefType,
              model_variables: FrozenVariableDict) -> 'FlaxOptimTrainState':
@@ -149,11 +197,19 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
 
     optimizer = optimizer_def.create(params)
     flax_mutables_axes = flax_mutables_axes or None
+    #  optax_optimizer = optax.chain(
+        #  optax.clip_by_global_norm(1.0),
+        #  optax.sgd(0.001, momentum=0.99),
+    #  )
+    #  optax_state = optax_optimizer.init(model_variables['params']['encoder']['prompt'])
     return FlaxOptimTrainState(
         optimizer,
         params_axes=params_axes,
         flax_mutables=flax_mutables,
-        flax_mutables_axes=flax_mutables_axes)
+        flax_mutables_axes=flax_mutables_axes,
+        #  optax_optimizer=optax_optimizer,
+        #  optax_state=optax_state,
+    )
 
   @property
   def step(self) -> jnp.ndarray:
@@ -177,8 +233,46 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
                      grads,
                      learning_rate,
                      flax_mutables=EMPTY_DICT) -> 'FlaxOptimTrainState':
-    new_optimizer = self._optimizer.apply_gradient(
-        grads, learning_rate=learning_rate)
+
+    import jax.experimental.host_callback as hcb
+
+    def local_update(*args):
+
+        global OPTAX_STATE
+
+        # unpack
+        prompt = jax.device_get(args[0][0])
+        grads = jax.device_get(args[0][1])
+
+        if OPTAX_STATE is None:
+            OPTAX_STATE = optax_init(prompt)
+        state = jax.device_get(OPTAX_STATE)
+
+        # Compute the update
+        new_prompt, state = optax_update(
+            prompt=prompt,
+            grads=grads,
+            state=state,
+        )
+
+        # upddate state and return new prompt
+        OPTAX_STATE = state
+        return new_prompt
+
+    args = (
+        self._optimizer.target['encoder']['prompt'],
+        grads['encoder']['prompt'],
+    )
+    new_prompt = hcb.call(local_update, args, result_shape=args[1])
+
+    params = self._optimizer.target
+    params = params.unfreeze()
+    params['encoder']['prompt'] = new_prompt
+    params = flax.core.freeze(params)
+    new_optimizer = self._optimizer.replace(target=params)
+
+    # the following should be our `OptaxOptimizer`, which does nothing.
+    #  new_optimizer = self._optimizer.apply_gradient(grads, learning_rate=learning_rate)
     return self.replace(_optimizer=new_optimizer, flax_mutables=flax_mutables)
 
   def replace_params(self, params: VariableDict) -> 'FlaxOptimTrainState':
