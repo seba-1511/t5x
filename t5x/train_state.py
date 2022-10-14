@@ -29,6 +29,11 @@ import jax
 import optax
 import functools
 
+import tensorflow as tf
+import os
+import pickle
+from melodi.colabs.shared_code import datasets
+
 import typing_extensions
 
 EMPTY_DICT = flax.core.freeze({})
@@ -38,26 +43,93 @@ MutableVariableDict = flax_scope.MutableVariableDict
 VariableDict = flax_scope.VariableDict
 
 
-def get_optax_optimizer():
-    return optax.adafactor(
-        learning_rate=0.05,
-        min_dim_size_to_factor=128,
-        decay_rate=0.8,
-        decay_offset=-1000000,
-        multiply_by_parameter_scale=False,
-        clipping_threshold=1.0,
-        momentum=None,
-        weight_decay_rate=1e-5,
-        eps=1e-30,
-        factored=True,
+#  @functools.partial(jax.jit, backend='cpu')
+def get_optax_optimizer(optimizer=None):
+
+    import jax
+    import optax
+    import numpy as np
+
+    from melodi.colabs.shared_code import optimizers
+    from melodi.colabs.shared_code import models
+
+    from flaxformer.architectures.t5 import t5_common_layers
+
+    #  if optimizer is None:
+        #  #  return optax.sgd(
+            #  #  learning_rate=0.05,
+        #  #  )
+        #  return optax.adafactor(
+            #  learning_rate=0.05,
+            #  min_dim_size_to_factor=128,
+            #  decay_rate=0.8,
+            #  decay_offset=-1000000,
+            #  multiply_by_parameter_scale=False,
+            #  clipping_threshold=1.0,
+            #  momentum=None,
+            #  weight_decay_rate=1e-5,
+            #  eps=1e-30,
+            #  factored=True,
+        #  )
+
+    N_FEATURES = 2048
+    prompt = np.random.randn(1, N_FEATURES)
+
+    # instantiate optimizer
+    embedder = models.NoOpEmbedder(
+        num_embeddings=1,
+        features=N_FEATURES,
+        one_hot=True,
+        name='token_embedder',
     )
+    transformer = optimizers.DecoderOnlyOptimizer(
+        model=t5_common_layers.decoder(
+            num_heads=6,
+            head_dim=64,
+            mlp_dim=1024,
+            num_layers=8,
+            shared_token_embedder=embedder,
+            dropout_rate=0.0,
+            activations=('gelu', 'linear'),
+        )
+    )
+    transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
+    optimizer = optimizers.GradientOptimizer(model=transformer)
+
+    if False: # random parameters
+        rng = jax.random.PRNGKey(1234)
+        parameters = optimizer.init(rng, {'gradients': prompt})
+        preprocessor = None
+    else:  # load from storage
+        checkpoint_path = os.path.join(
+            'gs://melodi-bucket0/melodi_training/horizon=2/memory=256',
+            'final_checkpoint.pkl',
+        )
+        with tf.io.gfile.GFile(name=checkpoint_path, mode='rb') as f:
+            checkpoint = pickle.load(f)
+
+        # get parameters
+        parameters = checkpoint['params']
+
+        # get preprocessor
+        preprocessor = datasets.DatasetPreprocessor()
+        preprocessor.set_state(checkpoint['preprocessor'])
+
+    melodi_optimizer = optimizers.PerTokenOptaxWrapper(
+        optimizer,
+        parameters,
+        memory=256,
+        preprocessor=preprocessor,
+    )
+
+    return melodi_optimizer
 
 
 # Has to be on GPU when call from host_callback, else deadlocks
 # when allocating new tensors.
 @functools.partial(jax.jit, backend='cpu')
-def optax_init(params):
-    return OPTAX_OPTIMIZER.init(params)
+def optax_init(prompt):
+    return OPTAX_OPTIMIZER.init(prompt)
 
 
 # Has to be on GPU when call from host_callback, else deadlocks
@@ -241,8 +313,8 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
         global OPTAX_STATE
 
         # unpack
-        prompt = jax.device_get(args[0][0])
-        grads = jax.device_get(args[0][1])
+        prompt = jax.device_get(args[0][0])['prompt']
+        grads = jax.device_get(args[0][1])['prompt']
 
         if OPTAX_STATE is None:
             OPTAX_STATE = optax_init(prompt)
@@ -254,20 +326,21 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
             grads=grads,
             state=state,
         )
+        new_prompt = flax.core.freeze({'prompt': new_prompt})
 
         # upddate state and return new prompt
         OPTAX_STATE = state
         return new_prompt
 
     args = (
-        self._optimizer.target['encoder']['prompt'],
-        grads['encoder']['prompt'],
+        self._optimizer.target['encoder']['prompt']['prompt'],
+        grads['encoder']['prompt']['prompt'],
     )
     new_prompt = hcb.call(local_update, args, result_shape=args[1])
 
     params = self._optimizer.target
     params = params.unfreeze()
-    params['encoder']['prompt'] = new_prompt
+    params['encoder']['prompt']['prompt'] = new_prompt
     params = flax.core.freeze(params)
     new_optimizer = self._optimizer.replace(target=params)
 
