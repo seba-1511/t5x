@@ -102,7 +102,7 @@ def get_optax_optimizer(optimizer=None):
         preprocessor = None
     else:  # load from storage
         checkpoint_path = os.path.join(
-            'gs://melodi-bucket0/melodi_training/horizon=2/memory=256',
+            'gs://melodi-bucket0/melodi_training/horizon=2/memory=256/bsz=64/lr=5e-5',
             'final_checkpoint.pkl',
         )
         with tf.io.gfile.GFile(name=checkpoint_path, mode='rb') as f:
@@ -142,6 +142,7 @@ def optax_update(prompt, grads, state):
         state,
         prompt,
     )
+    update = - 0.1 * (1.0 * update + 0.0 * grads)
     new_prompt = optax.apply_updates(prompt, update)
     return new_prompt, new_state
 
