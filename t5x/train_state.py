@@ -28,6 +28,7 @@ from t5x import optimizers
 import jax
 import optax
 import functools
+import gin
 
 import tensorflow as tf
 import os
@@ -44,6 +45,7 @@ VariableDict = flax_scope.VariableDict
 
 
 #  @functools.partial(jax.jit, backend='cpu')
+@gin.configurable
 def get_optax_optimizer(optimizer=None):
 
     import jax
@@ -56,21 +58,23 @@ def get_optax_optimizer(optimizer=None):
     from flaxformer.architectures.t5 import t5_common_layers
 
     #  if optimizer is None:
-        #  #  return optax.sgd(
-            #  #  learning_rate=0.05,
-        #  #  )
-        #  return optax.adafactor(
+        #  return optax.sgd(
             #  learning_rate=0.05,
-            #  min_dim_size_to_factor=128,
-            #  decay_rate=0.8,
-            #  decay_offset=-1000000,
-            #  multiply_by_parameter_scale=False,
-            #  clipping_threshold=1.0,
-            #  momentum=None,
-            #  weight_decay_rate=1e-5,
-            #  eps=1e-30,
-            #  factored=True,
         #  )
+    #  return optax.adafactor(
+        #  learning_rate=0.05,
+        #  min_dim_size_to_factor=128,
+        #  decay_rate=0.8,
+        #  decay_offset=-1000000,
+        #  multiply_by_parameter_scale=False,
+        #  clipping_threshold=1.0,
+        #  momentum=None,
+        #  weight_decay_rate=1e-5,
+        #  eps=1e-30,
+        #  factored=True,
+    #  )
+
+    # MELODI DEFINITION:
 
     N_FEATURES = 2048
     prompt = np.random.randn(1, N_FEATURES)
@@ -102,7 +106,7 @@ def get_optax_optimizer(optimizer=None):
         preprocessor = None
     else:  # load from storage
         checkpoint_path = os.path.join(
-            'gs://melodi-bucket0/melodi_training/horizon=2/memory=256/bsz=64/lr=5e-5',
+            'gs://melodi-bucket0/melodi_training/horizon=32/memory=256/bsz=64/lr=5e-5',
             'final_checkpoint.pkl',
         )
         with tf.io.gfile.GFile(name=checkpoint_path, mode='rb') as f:
@@ -122,8 +126,61 @@ def get_optax_optimizer(optimizer=None):
         preprocessor=preprocessor,
     )
 
-    return melodi_optimizer
+    # ADAFACTOR DEFINITION:
 
+    adafactor = optax.adafactor(
+        learning_rate=0.05,
+        min_dim_size_to_factor=128,
+        decay_rate=0.8,
+        decay_offset=-1000000,
+        multiply_by_parameter_scale=False,
+        clipping_threshold=1.0,
+        momentum=None,
+        weight_decay_rate=1e-5,
+        eps=1e-30,
+        factored=True,
+    )
+
+    # HEAVYBALL DEFINITION
+
+    heavyball = optax.sgd(
+        learning_rate=2.0,
+        momentum=None,
+    )
+
+    @jax.tree_util.register_pytree_node_class
+    class ChainedOptimizer:
+
+        def __init__(self, optimizers):
+            self.optimizers = optimizers
+
+        def init(self, prompt):
+            state = []
+            for opt in self.optimizers:
+                state.append(opt.init(prompt))
+            return state
+
+        def update(self, gradients, states, prompt):
+            update = gradients
+            new_states = []
+            for opt, state in zip(self.optimizers, states):
+                update, new_state = opt.update(update, state, prompt)
+                new_states.append(new_state)
+            return update, new_states
+
+        def tree_flatten(self):
+            contents = []
+            auxiliaries = [self.optimizers, ]
+            return contents, auxiliaries
+
+        @classmethod
+        def tree_unflatten(self, auxiliaries, contents):
+            return ChainedOptimizer(auxiliaries[0])
+
+    return ChainedOptimizer((melodi_optimizer, heavyball))
+    #  return melodi_optimizer
+    #  return ChainedOptimizer((melodi_optimizer, adafactor))
+    #  return adafactor
 
 # Has to be on GPU when call from host_callback, else deadlocks
 # when allocating new tensors.
@@ -136,13 +193,12 @@ def optax_init(prompt):
 # when allocating new tensors.
 @functools.partial(jax.jit, backend='cpu')
 def optax_update(prompt, grads, state):
-    optimizer = get_optax_optimizer()
+    optimizer = OPTAX_OPTIMIZER
     update, new_state = optimizer.update(
         grads,
         state,
         prompt,
     )
-    update = - 0.1 * (1.0 * update + 0.0 * grads)
     new_prompt = optax.apply_updates(prompt, update)
     return new_prompt, new_state
 
