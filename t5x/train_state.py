@@ -100,24 +100,25 @@ def get_optax_optimizer(optimizer=None):
     transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
     optimizer = optimizers.GradientOptimizer(model=transformer)
 
-    if False: # random parameters
-        rng = jax.random.PRNGKey(1234)
-        parameters = optimizer.init(rng, {'gradients': prompt})
-        preprocessor = None
-    else:  # load from storage
-        checkpoint_path = os.path.join(
-            'gs://melodi-bucket0/melodi_training/horizon=32/memory=256/bsz=64/lr=5e-5',
-            'final_checkpoint.pkl',
-        )
-        with tf.io.gfile.GFile(name=checkpoint_path, mode='rb') as f:
-            checkpoint = pickle.load(f)
+    #  if False: # random parameters
+        #  rng = jax.random.PRNGKey(1234)
+        #  parameters = optimizer.init(rng, {'gradients': prompt})
+        #  preprocessor = None
 
-        # get parameters
-        parameters = checkpoint['params']
+    checkpoint_path = os.path.join(
+        #  'gs://melodi-bucket0/melodi_training/horizon=32/memory=256/bsz=64/lr=5e-5',
+        'gs://melodi-bucket0/melodi_training/task=squad_v010_allanswers/horizon=32/memory=256/bsz=64/lr=5e-5',
+        'final_checkpoint.pkl',
+    )
+    with tf.io.gfile.GFile(name=checkpoint_path, mode='rb') as f:
+        checkpoint = pickle.load(f)
 
-        # get preprocessor
-        preprocessor = datasets.DatasetPreprocessor()
-        preprocessor.set_state(checkpoint['preprocessor'])
+    # get parameters
+    parameters = checkpoint['params']
+
+    # get preprocessor
+    preprocessor = datasets.DatasetPreprocessor()
+    preprocessor.set_state(checkpoint['preprocessor'])
 
     melodi_optimizer = optimizers.PerTokenOptaxWrapper(
         optimizer,
@@ -144,7 +145,7 @@ def get_optax_optimizer(optimizer=None):
     # HEAVYBALL DEFINITION
 
     heavyball = optax.sgd(
-        learning_rate=2.0,
+        learning_rate=1.0,
         momentum=None,
     )
 
