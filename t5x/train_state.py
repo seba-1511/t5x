@@ -46,7 +46,14 @@ VariableDict = flax_scope.VariableDict
 
 #  @functools.partial(jax.jit, backend='cpu')
 @gin.configurable
-def get_optax_optimizer(optimizer=None):
+def get_optax_optimizer(optimizer=None, melodi_path=None, learning_rate=0.3, momentum=0.0):
+
+    if optimizer is None:
+        optimizer = 'adafactor'
+    if momentum == 0.0:
+        momentum = None
+    if melodi_path is None:
+        melodi_path = 'gs://melodi-bucket0/melodi_training/task=glue_mnli_and_dev_v002/horizon=32/memory=256/bsz=64/lr=5e-5'
 
     import jax
     import optax
@@ -108,7 +115,7 @@ def get_optax_optimizer(optimizer=None):
     checkpoint_path = os.path.join(
         #  'gs://melodi-bucket0/melodi_training/horizon=32/memory=256/bsz=64/lr=5e-5',
         #  'gs://melodi-bucket0/melodi_training/task=squad_v010_allanswers/horizon=32/memory=256/bsz=64/lr=5e-5',
-        'gs://melodi-bucket0/melodi_training/task=glue_mnli_and_dev_v002/horizon=32/memory=256/bsz=64/lr=5e-5',
+        melodi_path,
         'final_checkpoint.pkl',
     )
     with tf.io.gfile.GFile(name=checkpoint_path, mode='rb') as f:
@@ -131,13 +138,13 @@ def get_optax_optimizer(optimizer=None):
     # ADAFACTOR DEFINITION:
 
     adafactor = optax.adafactor(
-        learning_rate=0.05,
+        learning_rate=learning_rate,
         min_dim_size_to_factor=128,
         decay_rate=0.8,
         decay_offset=-1000000,
         multiply_by_parameter_scale=False,
         clipping_threshold=1.0,
-        momentum=None,
+        momentum=momentum,
         weight_decay_rate=1e-5,
         eps=1e-30,
         factored=True,
@@ -146,8 +153,8 @@ def get_optax_optimizer(optimizer=None):
     # HEAVYBALL DEFINITION
 
     heavyball = optax.sgd(
-        learning_rate=1.0,
-        momentum=None,
+        learning_rate=learning_rate,
+        momentum=momentum,
     )
 
     @jax.tree_util.register_pytree_node_class
@@ -179,10 +186,14 @@ def get_optax_optimizer(optimizer=None):
         def tree_unflatten(self, auxiliaries, contents):
             return ChainedOptimizer(auxiliaries[0])
 
-    return ChainedOptimizer((melodi_optimizer, heavyball))
-    #  return melodi_optimizer
-    #  return ChainedOptimizer((melodi_optimizer, adafactor))
-    #  return adafactor
+    if optimizer == 'melodi':
+        return ChainedOptimizer((melodi_optimizer, heavyball))
+    if optimizer == 'heavyball':
+        return heavyball
+    if optimizer == 'adafactor':
+        return adafactor
+    if optimizer == 'melofactor':
+        return ChainedOptimizer((melodi_optimizer, adafactor))
 
 # Has to be on GPU when call from host_callback, else deadlocks
 # when allocating new tensors.
