@@ -107,7 +107,8 @@ def get_optax_optimizer(optimizer=None):
 
     checkpoint_path = os.path.join(
         #  'gs://melodi-bucket0/melodi_training/horizon=32/memory=256/bsz=64/lr=5e-5',
-        'gs://melodi-bucket0/melodi_training/task=squad_v010_allanswers/horizon=32/memory=256/bsz=64/lr=5e-5',
+        #  'gs://melodi-bucket0/melodi_training/task=squad_v010_allanswers/horizon=32/memory=256/bsz=64/lr=5e-5',
+        'gs://melodi-bucket0/melodi_training/task=glue_mnli_and_dev_v002/horizon=32/memory=256/bsz=64/lr=5e-5',
         'final_checkpoint.pkl',
     )
     with tf.io.gfile.GFile(name=checkpoint_path, mode='rb') as f:
