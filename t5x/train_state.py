@@ -130,7 +130,7 @@ def get_optax_optimizer(optimizer=None):
     # ADAFACTOR DEFINITION:
 
     adafactor = optax.adafactor(
-        learning_rate=0.05,
+        learning_rate=0.3,
         min_dim_size_to_factor=128,
         decay_rate=0.8,
         decay_offset=-1000000,
@@ -178,10 +178,10 @@ def get_optax_optimizer(optimizer=None):
         def tree_unflatten(self, auxiliaries, contents):
             return ChainedOptimizer(auxiliaries[0])
 
-    return ChainedOptimizer((melodi_optimizer, heavyball))
+    #  return ChainedOptimizer((melodi_optimizer, heavyball))
     #  return melodi_optimizer
     #  return ChainedOptimizer((melodi_optimizer, adafactor))
-    #  return adafactor
+    return adafactor
 
 # Has to be on GPU when call from host_callback, else deadlocks
 # when allocating new tensors.
