@@ -141,7 +141,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         learning_rate=learning_rate,
         min_dim_size_to_factor=128,
         decay_rate=0.8,
-        decay_offset=-1000000,
+        decay_offset=-1100000,
         multiply_by_parameter_scale=False,
         clipping_threshold=1.0,
         momentum=momentum,
