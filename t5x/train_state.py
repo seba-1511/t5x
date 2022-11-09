@@ -119,7 +119,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         'final_checkpoint.pkl',
     )
     with tf.io.gfile.GFile(name=checkpoint_path, mode='rb') as f:
-        checkpoint = pickle.load(f)
+        checkpoint = pickle.loads(f.read())
 
     # get parameters
     parameters = checkpoint['params']
