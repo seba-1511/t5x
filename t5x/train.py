@@ -249,7 +249,10 @@ def train(
                             model.FEATURE_CONVERTER_CLS)
   checkpoint_dataset = False
   if isinstance(train_ds, tf.data.Dataset):
-    train_iter = clu.data.TfDatasetIterator(train_ds)
+    try:
+        train_iter = clu.data.TfDatasetIterator(train_ds)
+    except:
+        train_iter = clu.data.TfDatasetIterator(train_ds, checkpoint=True)
     checkpoint_dataset = True
   elif isinstance(train_ds, clu.data.DatasetIterator):
     train_iter = train_ds
