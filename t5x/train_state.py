@@ -46,10 +46,10 @@ VariableDict = flax_scope.VariableDict
 
 #  @functools.partial(jax.jit, backend='cpu')
 @gin.configurable
-def get_optax_optimizer(optimizer=None, melodi_path=None, learning_rate=0.3, momentum=0.0):
+def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3, momentum=0.0):
 
-    if optimizer is None:
-        optimizer = 'adafactor'
+    if optimizer_name is None:
+        optimizer_name = 'adafactor'
     if momentum == 0.0:
         momentum = None
     if melodi_path is None:
@@ -186,27 +186,27 @@ def get_optax_optimizer(optimizer=None, melodi_path=None, learning_rate=0.3, mom
         def tree_unflatten(self, auxiliaries, contents):
             return ChainedOptimizer(auxiliaries[0])
 
-    if optimizer == 'melodi':
+    if optimizer_name == 'melodi':
         return ChainedOptimizer((melodi_optimizer, heavyball))
-    if optimizer == 'heavyball':
+    elif optimizer_name == 'heavyball':
         return heavyball
-    if optimizer == 'adafactor':
+    elif optimizer_name == 'adafactor':
         return adafactor
-    if optimizer == 'melofactor':
+    elif optimizer_name == 'melofactor':
         return ChainedOptimizer((melodi_optimizer, adafactor))
+    raise ValueError('Unknown optimizer =' + optimizer_name)
 
 # Has to be on GPU when call from host_callback, else deadlocks
 # when allocating new tensors.
-@functools.partial(jax.jit, backend='cpu')
-def optax_init(prompt):
-    return OPTAX_OPTIMIZER.init(prompt)
+@functools.partial(jax.jit, backend='cpu', static_argnames=['optimizer'])
+def optax_init(prompt, optimizer):
+    return jax.device_get(optimizer.init(prompt))
 
 
 # Has to be on GPU when call from host_callback, else deadlocks
 # when allocating new tensors.
-@functools.partial(jax.jit, backend='cpu')
-def optax_update(prompt, grads, state):
-    optimizer = OPTAX_OPTIMIZER
+@functools.partial(jax.jit, backend='cpu', static_argnames=['optimizer'])
+def optax_update(prompt, grads, state, optimizer):
     update, new_state = optimizer.update(
         grads,
         state,
@@ -216,7 +216,7 @@ def optax_update(prompt, grads, state):
     return new_prompt, new_state
 
 
-OPTAX_OPTIMIZER = get_optax_optimizer()
+OPTAX_OPTIMIZER = None
 OPTAX_STATE = None
 
 
@@ -381,13 +381,17 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
     def local_update(*args):
 
         global OPTAX_STATE
+        global OPTAX_OPTIMIZER
+
+        if OPTAX_OPTIMIZER is None:
+            OPTAX_OPTIMIZER = get_optax_optimizer()
 
         # unpack
         prompt = jax.device_get(args[0][0])['prompt']
         grads = jax.device_get(args[0][1])['prompt']
 
         if OPTAX_STATE is None:
-            OPTAX_STATE = optax_init(prompt)
+            OPTAX_STATE = optax_init(prompt, optimizer=OPTAX_OPTIMIZER)
         state = jax.device_get(OPTAX_STATE)
 
         # Compute the update
@@ -395,10 +399,11 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
             prompt=prompt,
             grads=grads,
             state=state,
+            optimizer=OPTAX_OPTIMIZER,
         )
         new_prompt = flax.core.freeze({'prompt': new_prompt})
 
-        # upddate state and return new prompt
+        # update state and return new prompt
         OPTAX_STATE = state
         return new_prompt
 
