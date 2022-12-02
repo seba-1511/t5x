@@ -35,8 +35,8 @@ from flax.serialization import from_state_dict
 from flax.serialization import to_state_dict
 import jax
 import jax.numpy as jnp
-from jestimator import amos
-from jestimator import amos_helper
+#  from jestimator import amos
+#  from jestimator import amos_helper
 import optax
 
 freeze = flax.core.frozen_dict.freeze
@@ -193,8 +193,8 @@ class OptaxStatePartitionRules:
   _RULES = {
 
       # Leaf Optax States:
-      amos.ScaleByAmosState:
-          amos_helper.state_partition_rule,
+      #  amos.ScaleByAmosState:
+          #  amos_helper.state_partition_rule,
       optax.AddNoiseState:
           lambda state, params_axes: optax.AddNoiseState(
               count=None, rng_key=None),
@@ -496,7 +496,7 @@ adabelief = wrap_optax_optimizer(optax.adabelief)
 adagrad = wrap_optax_optimizer(optax.adagrad)
 adam = wrap_optax_optimizer(optax.adam)
 adamw = wrap_optax_optimizer(optax.adamw)
-amos = wrap_optax_optimizer(amos.amos)
+#  amos = wrap_optax_optimizer(amos.amos)
 fromage = wrap_optax_optimizer(optax.fromage)
 lars = wrap_optax_optimizer(optax.lars)
 lamb = wrap_optax_optimizer(optax.lamb)
