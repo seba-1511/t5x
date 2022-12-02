@@ -22,7 +22,7 @@ r"""This script runs inference-evaluation on a T5X-compatible model.
 
 import functools
 import os
-from typing import Optional, Sequence, Type
+from typing import Callable, Mapping, Optional, Sequence, Tuple, Type
 
 # pylint:disable=g-import-not-at-top
 # TODO(adarob): Re-enable once users are notified and tests are updated.
@@ -30,11 +30,11 @@ os.environ['FLAX_LAZY_RNG'] = 'no'
 from absl import logging
 from clu import metric_writers
 import jax
-from jax.experimental import multihost_utils
 import seqio
 from t5x import gin_utils
 from t5x import models
 from t5x import partitioning
+from t5x import train_state as train_state_lib
 from t5x import utils
 from typing_extensions import Protocol
 
@@ -50,6 +50,121 @@ class SummarizeConfigFn(Protocol):
                summary_writer: Optional[metric_writers.SummaryWriter],
                step: int) -> None:
     ...
+
+
+class InferenceEvaluator:
+  """Runs evaluation of the model against a given SeqIo task."""
+
+  def __init__(
+      self,
+      infer_eval_dataset_cfg: utils.DatasetConfig,
+      inference_evaluator_cls: utils.EvaluatorConstructor,
+      model: models.BaseModel,
+      partitioner: partitioning.BasePartitioner,
+      log_dir: Optional[str] = None,
+      verify_matching_vocabs_fn: Optional[
+          Callable[[utils.DatasetConfig, models.BaseModel],
+                   None]] = utils.verify_matching_vocabs,
+  ):
+    """Constructs inference evaluator.
+
+    Args:
+      infer_eval_dataset_cfg: Specification for the dataset to evaluate with
+        using the inference metrics (e.g., uses sampled decoding). If None,
+        inference eval is disabled.
+      inference_evaluator_cls: seqio.Evaluator class to use for inference
+        evaluation, potentially with bound configuration args.
+      model: Model to be evaluated.
+      partitioner: the partitioner to use.
+      log_dir: Parent directory to log evaluation results.
+      verify_matching_vocabs_fn: Function to validate whether the task
+        vocabulary matches the model vocabulary. Should raise an exception on
+        error.
+    """
+    if verify_matching_vocabs_fn is not None:
+      verify_matching_vocabs_fn(infer_eval_dataset_cfg, model)
+
+    self._model = model
+    self._partitioner = partitioner
+    self._infer_eval_dataset_cfg = infer_eval_dataset_cfg
+    kwargs = {}
+    if log_dir:
+      kwargs['log_dir'] = os.path.join(log_dir, 'inference_eval')
+    else:
+      # Disable loggers if log dir is not provided.
+      kwargs['logger_cls'] = ()
+    self._seqio_evaluator = inference_evaluator_cls(
+        mixture_or_task_name=infer_eval_dataset_cfg.mixture_or_task_name,
+        feature_converter=model.FEATURE_CONVERTER_CLS(pack=False),
+        eval_split=infer_eval_dataset_cfg.split,
+        use_cached=infer_eval_dataset_cfg.use_cached,
+        seed=infer_eval_dataset_cfg.seed,
+        sequence_length=infer_eval_dataset_cfg.task_feature_lengths,
+        use_memory_cache=infer_eval_dataset_cfg.use_memory_cache,
+        **kwargs)
+    # Lazily initialized upon the first `evaluate` call.
+    self._predict_fn = None
+    self._predict_with_aux_fn = None
+    self._score_fn = None
+
+  @property
+  def model_feature_shapes(self) -> Mapping[str, Tuple[int, ...]]:
+    return self._seqio_evaluator.model_feature_shapes
+
+  @property
+  def eval_tasks(self) -> Sequence[seqio.Task]:
+    return self._seqio_evaluator.eval_tasks
+
+  def close(self):
+    self._seqio_evaluator.close()
+
+  def evaluate(
+      self,
+      train_state: train_state_lib.TrainState,
+      train_state_axes: train_state_lib.TrainState,
+  ) -> seqio.evaluation.AllMetricsFuture:
+    """Runs the prediction based inference eval.
+
+    Args:
+      train_state: Training state to run evaluation of.
+      train_state_axes: partitioning info for the train state to be used.
+
+    Returns:
+      A dictionary of training eval metrics.
+    """
+    if not self._predict_fn:
+      self._predict_fn = utils.get_infer_fn(
+          infer_step=self._model.predict_batch,
+          batch_size=self._infer_eval_dataset_cfg.batch_size,
+          train_state_axes=train_state_axes,
+          partitioner=self._partitioner)
+
+      self._predict_with_aux_fn = utils.get_infer_fn(
+          infer_step=self._model.predict_batch_with_aux,
+          batch_size=self._infer_eval_dataset_cfg.batch_size,
+          train_state_axes=train_state_axes,
+          partitioner=self._partitioner)
+
+      self._score_fn = utils.get_infer_fn(
+          infer_step=self._model.score_batch,
+          batch_size=self._infer_eval_dataset_cfg.batch_size,
+          train_state_axes=train_state_axes,
+          partitioner=self._partitioner)
+
+    all_metrics, _ = self._seqio_evaluator.evaluate(
+        compute_metrics=jax.process_index() == 0,
+        step=int(utils.get_local_data(train_state.step)),
+        predict_fn=functools.partial(
+            self._predict_fn,
+            train_state=train_state,
+            rng=jax.random.PRNGKey(0)),
+        score_fn=functools.partial(self._score_fn, train_state=train_state),
+        predict_with_aux_fn=functools.partial(
+            self._predict_with_aux_fn,
+            train_state=train_state,
+            rng=jax.random.PRNGKey(0)),
+    )
+    return all_metrics
 
 
 def evaluate(
@@ -95,31 +210,16 @@ def evaluate(
 
   summarize_config_fn(model_dir=output_dir, summary_writer=None, step=0)
 
-  ds_vocabs = utils.get_vocabulary(dataset_cfg)
-  if (ds_vocabs[0] != model.input_vocabulary or
-      ds_vocabs[1] != model.output_vocabulary):
-    raise ValueError(f'Model and Task vocabularies do not match:\n'
-                     f'  task={dataset_cfg.mixture_or_task_name}\n'
-                     f'  ds_vocabs=({ds_vocabs[0]}, {ds_vocabs[1]})\n'
-                     f'  model.input_vocabulary={model.input_vocabulary}\n'
-                     f'  model.output_vocabulary={model.output_vocabulary}\n')
-
-  # ----------------------------------------------------------------------------
-  # SeqIO (inference-based) evaluation setup
-  # ----------------------------------------------------------------------------
-  # Init evaluator to set up cached datasets
-  evaluator = inference_evaluator_cls(
-      mixture_or_task_name=dataset_cfg.mixture_or_task_name,
-      feature_converter=model.FEATURE_CONVERTER_CLS(pack=False),
-      eval_split=dataset_cfg.split,
-      use_cached=dataset_cfg.use_cached,
-      seed=dataset_cfg.seed,
-      sequence_length=dataset_cfg.task_feature_lengths,
-      log_dir=os.path.join(output_dir, 'inference_eval'),
-      use_memory_cache=dataset_cfg.use_memory_cache)
+  evaluator = InferenceEvaluator(
+      dataset_cfg,
+      inference_evaluator_cls,
+      model,
+      partitioner,
+      log_dir=output_dir)
   if not evaluator.eval_tasks:
     raise ValueError(
-        f"'{dataset_cfg.mixture_or_task_name}' has no metrics for evaluation.")
+        f"'{dataset_cfg.mixture_or_task_name}' has no metrics for evaluation, "
+        "or this mixture/task doesn't have provided split.")
 
   # ----------------------------------------------------------------------------
   # T5X model loading.
@@ -142,9 +242,6 @@ def evaluate(
                        train_state_initializer.global_train_state_shape,
                        partitioner)
 
-  predict_fn = None
-  score_fn = None
-
   # Disable strictness since we are dropping the optimizer state.
   restore_checkpoint_cfg.strict = False
 
@@ -153,45 +250,16 @@ def evaluate(
   for train_state in train_state_initializer.from_checkpoints(
       [restore_checkpoint_cfg], init_rng=fallback_init_rng):
 
-    # Compile the model only once.
-    if not predict_fn:
-      predict_fn = utils.get_infer_fn(
-          infer_step=model.predict_batch,
-          batch_size=batch_size,
-          train_state_axes=train_state_axes,
-          partitioner=partitioner)
-
-      predict_with_aux_fn = utils.get_infer_fn(
-          infer_step=model.predict_batch_with_aux,
-          batch_size=batch_size,
-          train_state_axes=train_state_axes,
-          partitioner=partitioner)
-
-      score_fn = utils.get_infer_fn(
-          infer_step=model.score_batch,
-          batch_size=batch_size,
-          train_state_axes=train_state_axes,
-          partitioner=partitioner)
-
     # ----------------------------------------------------------------------------
-    # Main training loop
+    # Main evaluation loop
     # ----------------------------------------------------------------------------
 
     # Run final evaluation (with decoding) on the full eval dataset.
     host_step = int(utils.get_local_data(train_state.step))
-    all_metrics, _, _ = evaluator.evaluate(
-        compute_metrics=jax.process_index() == 0,
-        step=host_step,
-        predict_fn=functools.partial(
-            predict_fn, train_state=train_state, rng=jax.random.PRNGKey(0)),
-        score_fn=functools.partial(score_fn, train_state=train_state),
-        predict_with_aux_fn=functools.partial(
-            predict_with_aux_fn,
-            train_state=train_state,
-            rng=jax.random.PRNGKey(0)))
+    all_metrics = evaluator.evaluate(train_state, train_state_axes)
     all_metrics.result()  # Ensure metrics are finished being computed.
     # Wait until computations are done before continuing.
-    multihost_utils.sync_global_devices(f'step_{host_step}:complete')
+    utils.sync_global_devices(f'step_{host_step}:complete')
 
   logging.info('Finished.')
 

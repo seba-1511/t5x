@@ -37,7 +37,6 @@ os.environ['FLAX_LAZY_RNG'] = 'no'
 from absl import logging
 from clu import metric_writers
 import jax
-from jax.experimental import multihost_utils
 import jax.numpy as jnp
 import numpy as np
 import seqio
@@ -356,7 +355,10 @@ def infer(
     fallback_init_rng: Optional[int] = None,
     merge_fn: MergeFn = merge_chunks_to_file,
     summarize_config_fn: SummarizeConfigFn = gin_utils.summarize_gin_config,
-):
+    verify_matching_vocabs_fn: Optional[
+        Callable[[utils.DatasetConfig, models.BaseTransformerModel],
+                 None]] = utils.verify_matching_vocabs,
+    output_vocab_feature_name: str = 'targets'):
   """Infer function.
 
   Args:
@@ -392,6 +394,10 @@ def infer(
     summarize_config_fn: A function that takes in the model directory, an
       optional SummaryWriter, and the step number, and writes a summary of the
       configuration. SummaryWriter will be None in most cases.
+    verify_matching_vocabs_fn: Function to validate whether the task vocabulary
+      matches the model vocabulary. Should raise an exception on error.
+    output_vocab_feature_name: The name of the feature corresponding to the
+      output vocabulary.
   """
   logging.info('Process ID: %d', jax.process_index())
 
@@ -410,13 +416,8 @@ def infer(
 
   # Remove double-slashes in directory path to avoid inconsistencies.
   output_dir = re.sub(r'(?<!gs:)([\/]{2,})', '/', output_dir)
-  ds_vocabs = utils.get_vocabulary(dataset_cfg)
-  if (ds_vocabs[0] != model.input_vocabulary or
-      ds_vocabs[1] != model.output_vocabulary):
-    raise ValueError(
-        'Model and Task vocabularies do not match.\n'
-        f'Task Input: {ds_vocabs[0]}, Model Input: {model.input_vocabulary}\n'
-        f'Task Output: {ds_vocabs[1]}, Model Output: {model.output_vocabulary}')
+  if verify_matching_vocabs_fn is not None:
+    verify_matching_vocabs_fn(dataset_cfg, model)
 
   batch_size = dataset_cfg.batch_size
 
@@ -542,17 +543,17 @@ def infer(
                                            chunk_ckpt_path: Optional[str]):
       write_tick = time.time()
       logging.info('Writing chunk %d results to %s', chunk, chunk_path)
-      write_fn(chunk_path, inferences, task_ds, mode,
-               task.output_features['targets'].vocabulary)
+      vocabulary = task.output_features[output_vocab_feature_name].vocabulary
+      write_fn(chunk_path, inferences, task_ds, mode, vocabulary)
       with gfile.GFile(chunk_path + '.COMPLETED', 'w') as f:
         f.write('')
       write_time = time.time() - write_tick
+      num_examples = len(inferences[0])
       logging.info('Writing completed in %02f seconds (%02f examples/sec).',
-                   write_time,
-                   len(inferences) / write_time)
+                   write_time, num_examples / write_time)
       update_measurement_series('writing_total_sec', chunk, write_time)
       update_measurement_series('writing_examples_per_sec', chunk,
-                                len(inferences) / write_time)
+                                num_examples / write_time)
 
       if chunk_ckpt_path:
         # Canonicalize checkpoint.
@@ -585,17 +586,18 @@ def infer(
         continue
 
       logging.info('Running inference on %d batches.', checkpoint_period)
-      inferences = _extract_tokens_and_aux_values(
-          infer_fn(model_ds.enumerate(), rng=chunk_rng))
+      infer_result = infer_fn(model_ds.enumerate(), rng=chunk_rng)
+      inferences: Tuple[Sequence[Any], Mapping[str, Any]] = (
+          _extract_tokens_and_aux_values(infer_result))
+      num_examples = len(inferences[0])
 
       if jax.process_index() == 0:
         chunk_time = time.time() - chunk_tick
         logging.info('chunk completed in %02f seconds (%02f examples/sec).',
-                     chunk_time,
-                     len(inferences) / chunk_time)
+                     chunk_time, num_examples / chunk_time)
         update_measurement_series('inference_total_sec', chunk, chunk_time)
         update_measurement_series('inference_examples_per_sec', chunk,
-                                  len(inferences) / chunk_time)
+                                  num_examples / chunk_time)
 
         chunk_ckpt_path = None
         if checkpoint_ds_iter:
@@ -620,8 +622,7 @@ def infer(
             chunk_ckpt_path=chunk_ckpt_path)
 
       # Wait for checkpoint to be written before continuing.
-      multihost_utils.sync_global_devices(
-          f'{task.name}:checkpoint_chunk{chunk:05}')
+      utils.sync_global_devices(f'{task.name}:checkpoint_chunk{chunk:05}')
 
     logging.info("Finished inference for task '%s'.", task.name)
 
@@ -640,7 +641,7 @@ def infer(
         f.write('')
 
     # Wait for host 0 to finish writing before exiting.
-    multihost_utils.sync_global_devices(f'{task.name}:complete')
+    utils.sync_global_devices(f'{task.name}:complete')
 
   for task in seqio.get_subtasks(task_or_mixture):
     logging.info("Starting inference for task '%s'", task.name)
