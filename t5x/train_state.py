@@ -220,6 +220,7 @@ OPTAX_OPTIMIZER = None
 OPTAX_STATE = None
 
 
+@typing_extensions.runtime_checkable
 class TrainState(typing_extensions.Protocol):
   """TrainState interface."""
 

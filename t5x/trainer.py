@@ -23,7 +23,7 @@ import enum
 import os
 import threading
 import time
-from typing import Any, Dict, Iterator, Mapping, MutableMapping, Optional, Sequence, TYPE_CHECKING, Tuple, Union, Protocol
+from typing import Any, Dict, Iterator, Mapping, MutableMapping, Optional, Protocol, Sequence, TYPE_CHECKING, Tuple, Union
 
 from absl import logging
 import cached_property
@@ -33,6 +33,7 @@ import clu.data
 import clu.metrics
 import clu.values
 from flax.core import FrozenDict
+import jax
 from jax.experimental import multihost_utils
 import jax.lax
 import jax.numpy as jnp
@@ -196,11 +197,14 @@ class WeightMetricsComputer(object):
         "weight_gradient_norm":
             metrics_lib.AveragePerStep.from_model_output(grad_norm)
     })
+    weight_update = jax.tree_util.tree_map(jnp.subtract, new_train_state.params,
+                                           old_train_state.params)
+    metrics.update(self._make_rms_metrics("weight_update_rms", weight_update))
+    weight_update_by_weight = jax.tree_util.tree_map(jnp.divide, weight_update,
+                                                     old_train_state.params)
     metrics.update(
-        self._make_rms_metrics(
-            "weight_update_rms",
-            jax.tree_util.tree_map(jnp.subtract, new_train_state.params,
-                                   old_train_state.params)))
+        self._make_rms_metrics("weight_update_divided_by_weight_rms",
+                               weight_update_by_weight))
     metrics.update(self._make_max_metrics("weight_max", new_train_state.params))
 
     return metrics
@@ -232,9 +236,11 @@ class _AsyncTimer(object):
         jax.block_until_ready(block_on)
       except RuntimeError as e:
         # If the buffer no longer exists, we assume it was completed.
-        if (str(e) !=
-            "INVALID_ARGUMENT: BlockHostUntilReady() called on deleted or "
-            "donated buffer"):
+        buffer_deleted_message = ("INVALID_ARGUMENT: BlockHostUntilReady() "
+                                  "called on deleted or donated buffer")
+        gda_buffer_deleted_message = ("INVALID_ARGUMENT: GetReadyFuture() "
+                                      "called on deleted or donated buffer")
+        if str(e) not in (buffer_deleted_message, gda_buffer_deleted_message):
           raise
       return time.time()
 
@@ -434,6 +440,9 @@ class BaseTrainer(abc.ABC):
 
     self.stop_training = False
 
+    # Time since the trainer was made, this will record the "uptime" of the job.
+    self._trainer_init_time = time.time()
+
     # The training metrics combine metrics added by the Model (e.g., loss and
     # accuracy) and Trainer (e.g., learning rate).
     self.train_metrics_manager = MetricsManager(
@@ -471,7 +480,8 @@ class BaseTrainer(abc.ABC):
       self._train_state = train_state
 
   def train(self,
-            batch_iter: Union[Iterator[BatchType], clu.data.DatasetIterator],
+            batch_iter: Union[Iterator[BatchType],
+                              clu.data.dataset_iterator.DatasetIterator],
             num_steps: int,
             start_step: Optional[int] = None) -> ArrayMapFuture:
     """Runs the train loop for the given number of steps."""
@@ -498,6 +508,10 @@ class BaseTrainer(abc.ABC):
             metrics = metrics_update
 
       self.train_state = train_state
+
+    if metrics is not None:
+      metrics["timing/uptime"] = clu.metrics.LastValue.from_model_output(
+          jnp.asarray([time.time() - self._trainer_init_time]))
 
     return self.train_metrics_manager.write_metrics_summary(
         metrics, start_step + num_steps, num_steps)
@@ -540,15 +554,19 @@ class BaseTrainer(abc.ABC):
       mm.start_duration_timer(block_on=train_state)
       for batch in batch_iter:
         num_steps += 1
-        multihost_utils.assert_equal(
+        utils.multihost_assert_equal(
             jnp.array(num_steps),
             "Eval step mismatch across hosts. Check for empty dataset shard.")
+        if jax.config.jax_array and jax.process_count() > 1:
+          batch = multihost_utils.host_local_array_to_global_array(
+              batch, self._partitioner.mesh,
+              self._partitioner.data_partition_spec)
         metrics_update = eval_step_fn(train_state, batch)
         if metrics:
           metrics = merge_metrics(metrics, metrics_update)
         else:
           metrics = metrics_update
-      multihost_utils.assert_equal(
+      utils.multihost_assert_equal(
           jnp.array(-1),
           "Eval step mismatch across hosts. Check for empty dataset shard.")
 
@@ -581,6 +599,10 @@ class BaseTrainer(abc.ABC):
       tick = time.time()
       cache_key: BatchSpec = FrozenDict(jax.eval_shape(lambda: batch))  # pylint:disable=cell-var-from-loop
       if cache_key not in self._compiled_eval_step_cache:
+        if jax.config.jax_array and jax.process_count() > 1:
+          batch = multihost_utils.host_local_array_to_global_array(
+              batch, self._partitioner.mesh,
+              self._partitioner.data_partition_spec)
         self._compiled_eval_step_cache[cache_key] = self._partitioner.compile(
             self._partitioned_eval_step, self.train_state, batch)
       self._compiled_eval_steps[eval_name] = self._compiled_eval_step_cache[

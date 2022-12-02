@@ -62,12 +62,13 @@ export_lib.save:
   output_dir = %MODEL_OUTPUT_DIR
   model_name = %MODEL_NAME
   batch_size = %BATCH_SIZE
+  native_lowering = False
 
 utils.RestoreCheckpointConfig:
   path = %CHECKPOINT_PATH
   mode = 'specific'
   dtype = 'bfloat16'
-  checkpointer_cls = checkpoints.Checkpointer
+  checkpointer_cls = @checkpoints.Checkpointer
   # TODO(b/234480674): GDA disabled due to incompatibility with export.
   use_gda = False
 

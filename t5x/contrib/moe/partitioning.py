@@ -55,14 +55,14 @@ def get_gpu_mesh() -> Mesh:
   return Mesh(devices, ['data', 'expert', 'model'])
 
 
-def default_moe_mesh(num_experts: int,
+def default_moe_mesh(num_expert_partitions: int,
                      num_partitions: Optional[int] = None,
                      model_parallel_submesh: Optional[HardwareMesh] = None,
                      backend: Optional[str] = None) -> Mesh:
   """Construct default xmap/pjit mesh for MoE.
 
   Unlike the vanilla T5X mesh, this mesh has three resource axes:
-  - 'expert': a 1D submesh with length that divides into `num_experts`,
+  - 'expert': 1D submesh with length that divides into `num_expert_partitions`,
   - 'model': specified by the provided `model_parallel_submesh` shape, and
   - 'data', which covers the rest of the mesh.
 
@@ -70,7 +70,9 @@ def default_moe_mesh(num_experts: int,
   factoring along the 'data' axis length.
 
   Args:
-    num_experts: Total number of experts across all devices.
+    num_expert_partitions: Upper bound for size of expert parallel submesh. This
+      must be <= the number of experts. Actual values depends on number of
+      available devices.
     num_partitions: Specifies the size of the model parallel submesh to be
       automatically selected for the current topology. See
       `model_parallel_submesh` for details on how this submesh is used. Mutually
@@ -92,8 +94,9 @@ def default_moe_mesh(num_experts: int,
                                                      backend)
   data_axis_size, model_axis_size = base_default_mesh.devices.shape
 
-  # Factor out the largest divisor of 'data' axis satisfying <= `num_experts`.
-  expert_axis_size = num_experts
+  # Factor out the largest divisor of 'data' axis satisfying <=
+  # `num_expert_partitions`.
+  expert_axis_size = num_expert_partitions
   while data_axis_size % expert_axis_size != 0:
     expert_axis_size -= 1
 
@@ -104,6 +107,8 @@ def default_moe_mesh(num_experts: int,
   logging.info('Overridden MoE global_mesh axes_names: %s',
                global_mesh.axis_names)
   logging.info('Overridden MoE global_mesh devices: %s', global_mesh.devices)
+  logging.info('Overridden MoE global_mesh shape: %s',
+               global_mesh.devices.shape)
   return global_mesh
 
 
@@ -121,7 +126,7 @@ class MoePjitPartitioner(base_partitioning.PjitPartitioner):
   """
 
   def __init__(self,
-               num_experts: int,
+               num_expert_partitions: int,
                num_partitions: Optional[int] = None,
                model_parallel_submesh: Optional[HardwareMesh] = None,
                params_on_devices: bool = True,
@@ -129,8 +134,12 @@ class MoePjitPartitioner(base_partitioning.PjitPartitioner):
                state_filter_fn: Optional[Callable[[str], bool]] = None):
     """Configures the partitioner.
 
+    TODO(jamesleethorp): Rename num_partitions -> num_model_partitions.
+
     Args:
-      num_experts: Total number of experts across all devices.
+      num_expert_partitions: Specifies the upper bound for size of the expert
+        parallel submesh. This must be <= the number of experts. Actual value
+        depends on number of available devices.
       num_partitions: Specifies the size of the model parallel submesh to be
         automatically selected for the current topology. See
         `model_parallel_submesh` for details on how this submesh is used.
@@ -158,7 +167,7 @@ class MoePjitPartitioner(base_partitioning.PjitPartitioner):
         params_on_devices=params_on_devices,
         logical_axis_rules=logical_axis_rules)
 
-    self._num_experts = num_experts
+    self._num_expert_partitions = num_expert_partitions
     self._state_filter_fn = state_filter_fn
 
   @property
@@ -175,7 +184,7 @@ class MoePjitPartitioner(base_partitioning.PjitPartitioner):
   @cached_property.cached_property
   def mesh(self) -> Mesh:
     """Overrides default T5X mesh with ('data', 'expert', 'model') mesh."""
-    return default_moe_mesh(self._num_experts, self._num_partitions,
+    return default_moe_mesh(self._num_expert_partitions, self._num_partitions,
                             self._model_parallel_submesh, self._backend)
 
   def get_data_layout(self,
@@ -447,7 +456,7 @@ def override_partition_specs(resources: Pytree):
 
 def _infer_state_filter_fn(
     train_state: FlaxOptimTrainState) -> Optional[Callable[[str], bool]]:
-  """Infers relevant regex matching sharded expert model state for optimizer.
+  """Infers relevant regex matching sharded expert model state for train state.
 
   The model state generally inherits the correct partitioning specs from the
   model parameters. In such cases, no state_filter_fn is required. However,
@@ -467,19 +476,44 @@ def _infer_state_filter_fn(
     ValueError if optimizer (on train state) is not a recognized optimizer type.
   """
   optimizer = train_state._optimizer  # pylint: disable=protected-access
-  optimizer_def = optimizer.optimizer_def
+  opt_def = optimizer.optimizer_def
 
-  if isinstance(optimizer_def, optimizers.OptaxWrapper):
+  if isinstance(opt_def, optimizers.MultiOptimizer):
+    if not opt_def.sub_optimizers:
+      # No suboptimizers, so no state updates are required.
+      return None
+
+    all_same_type = all(
+        type(opt) is type(opt_def.sub_optimizers[0])
+        for opt in opt_def.sub_optimizers)
+    if not all_same_type:
+      raise ValueError('optimizers.MultiOptimizer is only supported in cases '
+                       'where all suboptimizers are of the same type.')
+
+    if isinstance(opt_def.sub_optimizers[0], adafactor.Adafactor):
+      all_same_factoring = all(opt.hyper_params.factored ==
+                               opt_def.sub_optimizers[0].hyper_params.factored
+                               for opt in opt_def.sub_optimizers)
+      if not all_same_factoring:
+        raise ValueError(
+            'If using adafactor.Adafactor as the suboptimizer in '
+            'optimizers.MultiOptimizer, all suboptimizers must be either '
+            'factored or unfactored (cannot use mixed factoring).')
+
+    # Use first suboptimizer as representative.
+    opt_def = opt_def.sub_optimizers[0]
+
+  if isinstance(opt_def, optimizers.OptaxWrapper):
     # T5X wrapped optax optimizers inherit the correct specs, so no state
     # updates will be required.
     return None
 
-  if not isinstance(optimizer_def, adafactor.Adafactor):
+  if not isinstance(opt_def, adafactor.Adafactor):
     raise ValueError('Unrecognized optimizer type. Expecting '
                      'optimizers.OptaxWrapper or adafactor.Adafactor. '
-                     f'Received: {optimizer_def}')
+                     f'Received: {opt_def}')
 
-  if optimizer_def.hyper_params.factored:
+  if opt_def.hyper_params.factored:
     # Factored kernel terms (`v_col` and `v_row`) need to be identified for
     # expert sharding.
     return training_utils.match_fn(r'.*expert.*/kernel/v_.*')

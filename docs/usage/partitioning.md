@@ -63,6 +63,20 @@ For an example in context, see [`layers.py`][param_with_axes].
 Tip: We recommend you use the *canonical* logical axis names listed
 [below](#canonical-logical-axis-names).
 
+To specify the logical axes for *activation partitioning*, provide the logical axes
+names to `flax.linen.partitioning.with_sharding_constraint` (instead of using
+`jax.pjit.with_sharding_constraint` or
+`t5x.partitioning.with_sharding_constraint`).
+
+```py
+from flax.linen import partitioning
+
+...
+output = jnp.dot(x, embedding)
+output = with_sharding_constraint(output, ('batch', 'length', 'embed'))
+return output
+```
+
 ### Map logical names to device
 
 For `jax.pjit` to know how to partition these arrays across the hardware, the
@@ -83,19 +97,6 @@ referring to the default mappings for data- and model-parallelism.
 > *   [`t5x.partitioning.standard_logical_axis_rules`][standard-rules]
 >     implementation
 
-To specify hardware axes for *activation partitioning*, provide the logical axes
-names to `flax.linen.partitioning.with_sharding_constraint` (instead of using
-`jax.pjit.with_sharding_constraint` or
-`t5x.partitioning.with_sharding_constraint`).
-
-```py
-from flax.linen import partitioning
-
-...
-output = jnp.dot(x, embedding)
-output = with_sharding_constraint(output, ('batch', 'length', 'embed'))
-return output
-```
 
 
 #### Configuring `PjitPartitioner`
@@ -426,8 +427,8 @@ partitioning.PjitPartitioner.logical_axis_rules = [
 [flaxformer]: https://github.com/google/flaxformer/tree/main/flaxformer/architectures/t5/
 [lan]: https://github.com/google/flax/tree/main/flax/linen/partitioning.py
 [megatron]: https://arxiv.org/abs/1909.08053
-[minimal]: https://github.com/google-research/t5x/tree/main/t5x/examples/
+[minimal]: https://github.com/google-research/t5x/blob/main/t5x/examples/
 [optimus]: https://arxiv.org/abs/2104.05343
-[param_with_axes]: https://github.com/google-research/t5x/tree/main/t5x/examples/t5/layers.py;rcl=427300354;l=462
+[param_with_axes]: https://github.com/google-research/t5x/blob/main/t5x/examples/t5/layers.py;rcl=427300354;l=462
 [pjit]: https://github.com/google/jax/tree/main/jax/experimental/pjit.py
-[standard-rules]: https://github.com/google-research/t5x/tree/main/t5x/partitioning.py?l=438&rcl=421294093
+[standard-rules]: https://github.com/google-research/t5x/blob/main/t5x/partitioning.py?l=438&rcl=421294093
