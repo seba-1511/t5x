@@ -132,6 +132,7 @@ class InferenceEvaluator:
     Returns:
       A dictionary of training eval metrics.
     """
+    logging.info('Train Step: %s.', train_state.step.addressable_shards[0].data)
     if not self._predict_fn:
       self._predict_fn = utils.get_infer_fn(
           infer_step=self._model.predict_batch,

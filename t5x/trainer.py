@@ -544,6 +544,7 @@ class BaseTrainer(abc.ABC):
     train_state = self.train_state
     for iter_name, batch_iter in batch_iters.items():
       logging.info("Evaluating: %s.", iter_name)
+      logging.info('Train Step: %s.', train_state.step.addressable_shards[0].data)
       metrics = None
       # Use a pre-compiled step function, if available.
       eval_step_fn = self._compiled_eval_steps.get(iter_name,
