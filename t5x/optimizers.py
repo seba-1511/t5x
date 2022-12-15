@@ -35,6 +35,8 @@ from flax.serialization import from_state_dict
 from flax.serialization import to_state_dict
 import jax
 import jax.numpy as jnp
+#  from jestimator import amos
+#  from jestimator import amos_helper
 import optax
 
 freeze = flax.core.frozen_dict.freeze
@@ -85,7 +87,7 @@ class OptimizerDef:
       target: the object to be optimized. This is typically a variable dict
         returned by `flax.linen.Module.init()`, but it can also be a container
         of variables dicts, e.g. `(v1, v2)` and  `('var1': v1, 'var2': v2)` are
-          valid inputs as well.
+        valid inputs as well.
 
     Returns:
       An instance of `Optimizer`.
@@ -191,6 +193,8 @@ class OptaxStatePartitionRules:
   _RULES = {
 
       # Leaf Optax States:
+      #  amos.ScaleByAmosState:
+          #  amos_helper.state_partition_rule,
       optax.AddNoiseState:
           lambda state, params_axes: optax.AddNoiseState(
               count=None, rng_key=None),
@@ -225,8 +229,6 @@ class OptaxStatePartitionRules:
           lambda state, params_axes: optax.ScaleByTrustRatioState(),
       optax.ScaleByScheduleState:
           lambda state, params_axes: optax.ScaleByScheduleState(count=None),
-      optax.ScaleByFromageState:
-          lambda state, params_axes: optax.ScaleByFromageState(count=None),
       optax.ZeroNansState:
           lambda state, params_axes: optax.ZeroNansState(found_nan=None),
       # FactoredState
@@ -298,7 +300,7 @@ class OptaxStatePartitionRules:
   def derive_optax_logical_axes(cls, optax_state, params_axes):
     """Derived logical axes for optax state."""
     # Flatten the optax state but do not go into the registered states.
-    flattened_state, tree_def = jax.tree_flatten(
+    flattened_state, tree_def = jax.tree_util.tree_flatten(
         optax_state, is_leaf=cls._is_optax_state)
 
     def derive_fn(x):
@@ -310,7 +312,7 @@ class OptaxStatePartitionRules:
       return cls._RULES[type(x)](x, params_axes)
 
     flattened_axes = [derive_fn(x) for x in flattened_state]
-    derived_axes = jax.tree_unflatten(tree_def, flattened_axes)
+    derived_axes = jax.tree_util.tree_unflatten(tree_def, flattened_axes)
     return derived_axes
 
 
@@ -494,6 +496,7 @@ adabelief = wrap_optax_optimizer(optax.adabelief)
 adagrad = wrap_optax_optimizer(optax.adagrad)
 adam = wrap_optax_optimizer(optax.adam)
 adamw = wrap_optax_optimizer(optax.adamw)
+#  amos = wrap_optax_optimizer(amos.amos)
 fromage = wrap_optax_optimizer(optax.fromage)
 lars = wrap_optax_optimizer(optax.lars)
 lamb = wrap_optax_optimizer(optax.lamb)

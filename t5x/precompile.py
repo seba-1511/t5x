@@ -27,7 +27,9 @@ a proper lowering under TPU mesh.
 """
 
 import os
-from typing import Iterator, Optional
+from typing import Callable, Optional
+
+import clu.data
 
 import jax
 from jax import random
@@ -49,6 +51,9 @@ def precompile(
     model_dir: str,
     random_seed: Optional[int],
     get_dataset_fn: utils.GetDatasetCallable = utils.get_dataset,
+    verify_matching_vocabs_fn: Optional[
+        Callable[[utils.DatasetConfig, models.BaseTransformerModel],
+                 None]] = utils.verify_matching_vocabs,
 ):
   """Compiles and dump the HLO to model dir, with HLO text dumps."""
   rng = random.PRNGKey(random_seed or 42)
@@ -60,34 +65,23 @@ def precompile(
   ds_shard_id = data_layout.shard_id
   num_ds_shards = data_layout.num_shards
 
-  def _verify_matching_vocabs(cfg: utils.DatasetConfig):
-    ds_vocabs = utils.get_vocabulary(cfg)
-    if (ds_vocabs[0] != model.input_vocabulary or
-        ds_vocabs[1] != model.output_vocabulary):
-      raise ValueError(f'Model and Task vocabularies do not match:\n'
-                       f'  task={cfg.mixture_or_task_name}\n'
-                       f'  ds_vocabs=({ds_vocabs[0]}, {ds_vocabs[1]})\n'
-                       f'  model.input_vocabulary={model.input_vocabulary}\n'
-                       f'  model.output_vocabulary={model.output_vocabulary}\n')
+  if verify_matching_vocabs_fn is not None:
+    verify_matching_vocabs_fn(train_dataset_cfg, model)
 
-  _verify_matching_vocabs(train_dataset_cfg)
-
-  train_ds = get_dataset_fn(train_dataset_cfg, ds_shard_id, num_ds_shards,
-                            model.FEATURE_CONVERTER_CLS)
+  train_iter = get_dataset_fn(train_dataset_cfg, ds_shard_id, num_ds_shards,
+                              model.FEATURE_CONVERTER_CLS)
+  if isinstance(train_iter, tf.data.Dataset):
+    train_iter = clu.data.TfDatasetIterator(train_iter, checkpoint=True)
+  elif not isinstance(train_iter, clu.data.dataset_iterator.DatasetIterator):
+    raise ValueError(
+        f'get_dataset_fn returned unsupported type {type(train_iter)}.')
 
   # Need to use full batch size.
-  input_shapes = {
-      k: (data_layout.batch_size, *v.shape[1:])
-      for k, v in train_ds.element_spec.items()
-  }
-  input_types = {
-      k: v.dtype.as_numpy_dtype() for k, v in train_ds.element_spec.items()
-  }
-
-  checkpointable_train_iter = iter(train_ds)
-  train_iter: Iterator[trainer_lib.BatchType] = map(
-      lambda x: jax.tree_map(np.array, x), checkpointable_train_iter)
-  batch = next(train_iter)
+  input_shapes = jax.tree_map(lambda x: (data_layout.batch_size, *x.shape[1:]),
+                              train_iter.element_spec)
+  input_types = jax.tree_map(lambda x: x.dtype, train_iter.element_spec)
+  dummy_batch = jax.tree_map(lambda x: np.ones(x.shape, x.dtype),
+                             train_iter.element_spec)
 
   # Compiling does not care about loading real weights.
   train_state_initializer = utils.TrainStateInitializer(
@@ -118,7 +112,7 @@ def precompile(
   # PartitionedTrainCallable has lower() defined but isn't exposed in pytype.
   # TODO(hthu): Explicitly expose the lower() interface.
   # pytype: disable=attribute-error
-  lowered = partitioned_step.lower(train_state_shape, batch)
+  lowered = partitioned_step.lower(train_state_shape, dummy_batch)
   # pytype: enable=attribute-error
 
 

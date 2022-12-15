@@ -18,6 +18,7 @@ import dataclasses
 import os
 import re
 from typing import Optional
+import unittest
 
 from absl import flags
 from absl.testing import absltest
@@ -375,6 +376,75 @@ class UtilsTest(parameterized.TestCase):
           np.array([8, 0]),
       ])
 
+  @mock.patch.object(utils, "get_dataset")
+  def test_get_training_eval_datasets_mixture_obj(self, mock_get_dataset):
+    # Verify calls to utils.dataset using seqio.Task or seqio.Mixture
+    # Register a mock SeqIO mixture.
+    task3 = mock.create_autospec(seqio.Task, instance=True)
+    task3.name = "mock_task3"
+    task3.splits = set(["train", "test"])
+    task4 = mock.create_autospec(seqio.Task, instance=True)
+    task4.name = "mock_task4"
+    task4.splits = set(["train", "test"])
+    seqio.TaskRegistry.add_provider("mock_task3", task3)
+    seqio.TaskRegistry.add_provider("mock_task4", task4)
+    mixture = seqio.Mixture(
+        "mock_mix2", ["mock_task3", "mock_task4"], default_rate=1.0)
+    seqio.MixtureRegistry.add_provider("mock_mix2", mixture)
+
+    mock_get_dataset.return_value = tf.data.Dataset.range(10).batch(1)
+    cfg_obj = utils.DatasetConfig(
+        mixture_or_task_name=mixture,
+        task_feature_lengths={},
+        split="test",
+        batch_size=4,
+        shuffle=False,
+        seed=23)
+
+    res_obj = utils.get_training_eval_datasets(
+        cfg_obj,
+        shard_id=0,
+        num_shards=2,
+        eval_steps=3,
+        feature_converter_cls=seqio.FeatureConverter)
+
+    expected_calls = expected_calls = [
+        mock.call(
+            dataclasses.replace(
+                cfg_obj, mixture_or_task_name="mock_task3", batch_size=1),
+            shard_id=0,
+            num_shards=1,
+            feature_converter_cls=seqio.FeatureConverter,
+            continue_from_last_checkpoint=False,
+            num_epochs=12),
+        mock.call(
+            dataclasses.replace(
+                cfg_obj, mixture_or_task_name="mock_task4", batch_size=1),
+            shard_id=0,
+            num_shards=1,
+            feature_converter_cls=seqio.FeatureConverter,
+            continue_from_last_checkpoint=False,
+            num_epochs=12),
+        mock.call(
+            dataclasses.replace(cfg_obj, batch_size=1),
+            shard_id=0,
+            num_shards=1,
+            feature_converter_cls=seqio.FeatureConverter,
+            continue_from_last_checkpoint=False,
+            num_epochs=12)
+    ]
+
+    mock_get_dataset.assert_has_calls(expected_calls)
+
+    self.assertSameElements(res_obj.keys(),
+                            ["mock_task3", "mock_task4", "mock_mix2"])
+    for ds in res_obj.values():
+      jax.tree_map(np.testing.assert_equal, list(ds), [
+          np.array([0, 2]),
+          np.array([4, 6]),
+          np.array([8, 0]),
+      ])
+
   def test_override_params_axes_names(self):
     model_variables = flax.core.freeze({
         "params": {
@@ -458,6 +528,42 @@ class MockCheckpointer(checkpoints.Checkpointer):
   # for simplicity.
   def restore(self, path, *args, **kwargs):
     return MockTrainState(path=path, from_scratch=False)
+
+
+class MockCheckpointManager(checkpoints.CheckpointManager):
+
+  def __init__(self, *args, **kwargs):
+    pass
+
+  def restore(self, path, *args, **kwargs):
+    return MockTrainState(path=path, from_scratch=False)
+
+
+class OrbaxRestoreTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+
+    self.ckptdir = self.create_tempdir(name="primary_checkpoints")
+    steps = (2, 3)
+    self.paths = []
+    for s in steps:
+      step_dir = self.ckptdir.mkdir(f"checkpoint_{s}")
+      step_dir.create_file("checkpoint")
+      self.paths += [step_dir.full_path]
+
+  def test_orbax_restore(self):
+    # Properties of config not needed in this test.
+    restore_cfg = utils.RestoreCheckpointConfig(path=[])
+
+    manager = MockCheckpointManager()
+    restored = utils.restore(manager, [self.paths[0]], restore_cfg)
+    self.assertIsInstance(restored, MockTrainState)
+    self.assertEqual(restored.path, self.paths[0])
+
+    restored = utils.restore(manager, self.paths, restore_cfg)
+    self.assertIsInstance(restored, list)
+    self.assertSequenceEqual([state.path for state in restored], self.paths)
 
 
 class TrainStateInitializerTest(parameterized.TestCase):

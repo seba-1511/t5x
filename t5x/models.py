@@ -287,12 +287,28 @@ class BaseTransformerModel(BaseModel):
         label_smoothing=self._label_smoothing,
         z_loss=self._z_loss,
         loss_normalizing_factor=loss_normalizing_factor)
+
+    # segment ids to compute packing, padding etc.
+    segment_ids = {
+        k[:-len('_segment_ids')]: v
+        for k, v in batch.items()
+        if k.endswith('_segment_ids')
+    }
+    # If these don't exist then we can create only padding mask.
+    if not segment_ids:
+      segment_ids = {
+          k: v != 0
+          for k, v in batch.items()
+          if k in ('encoder_input_tokens', 'decoder_target_tokens')
+      }
+
     metrics = self._compute_metrics(
         logits=logits,
         targets=batch['decoder_target_tokens'],
         mask=weights,
         loss=loss,
-        z_loss=z_loss)
+        z_loss=z_loss,
+        segment_ids=segment_ids)
     return loss, metrics
 
   def _compute_metrics(
@@ -302,9 +318,15 @@ class BaseTransformerModel(BaseModel):
       mask: jnp.ndarray,
       loss: jnp.ndarray,
       z_loss: Optional[jnp.ndarray] = None,
+      segment_ids: Optional[Mapping[str, jnp.ndarray]] = None,
   ) -> MetricsMap:
     return compute_base_metrics(
-        logits=logits, targets=targets, mask=mask, loss=loss, z_loss=z_loss)
+        logits=logits,
+        targets=targets,
+        mask=mask,
+        loss=loss,
+        z_loss=z_loss,
+        segment_ids=segment_ids)
 
 
 class EncoderDecoderModel(BaseTransformerModel):
@@ -717,13 +739,19 @@ class DecoderOnlyModel(BaseTransformerModel):
       params: PyTreeDef,
       batch: Mapping[str, jnp.ndarray],
       dropout_rng: Optional[jax.random.KeyArray] = None,
-      mutable: flax_scope.CollectionFilter = False) -> jnp.ndarray:
+      mutable: flax_scope.CollectionFilter = False,
+      other_variables: Optional[PyTreeDef] = None) -> jnp.ndarray:
     """Computes logits via a forward pass of `self.module`."""
     rngs = {'dropout': dropout_rng} if dropout_rng is not None else None
     decoder_causal_attention = self._get_decoder_causal_attention(batch)
+    if other_variables is None:
+      other_variables = {}
 
     return self.module.apply(
-        {'params': params},
+        {
+            'params': params,
+            **other_variables
+        },
         batch['decoder_input_tokens'],
         batch['decoder_target_tokens'],
         decoder_segment_ids=batch.get('decoder_segment_ids', None),
@@ -1113,12 +1141,47 @@ def compute_metrics(logits: jnp.ndarray, targets: jnp.ndarray,
   return metrics
 
 
+def count_packed_examples(segment_ids: jnp.ndarray) -> int:
+  """Return the number of packed examples.
+
+  After packing, each row of segment_ids contains the ids of packed examples.
+  For some model inputs, some features could have some examples but not others.
+  For example, two tasks in a multimodal setup could be: (1). text -> text, and
+  (2). image -> text. Examples from (1) will be missing image input feature and
+  examples from (2) will be missing text input feature.
+
+  To count the packed examples, we count the unique ids in segment_ids excluding
+  0s (because of padding). It can be implemented by counting the number of
+  non-zero values in the first discrete difference along axis=1, plus the number
+  of rows in segment_ids, and minus the number of padded examples.
+
+  Example:
+    [[1, 1, 3, 3, 0, 0],
+     [2, 2, 2, 2, 2, 2],
+     [2, 7, 7, 7, 7, 0]] has 5 packed examples.
+
+  Args:
+    segment_ids: [B, L] array.
+
+  Returns:
+    Scalar count.
+  """
+
+  # If there is padding, it's at the end and the id is always 0.
+  num_padded_examples = jnp.sum(segment_ids[:, -1] == 0)
+  # Get the first discrete different along axis=1.
+  first_diff = jnp.diff(segment_ids, n=1, axis=1)
+  # count = #(non-0 diff) + #(row) - #(padded ex).
+  return jnp.sum(first_diff != 0) + segment_ids.shape[0] - num_padded_examples
+
+
 def compute_base_metrics(
     logits: jnp.ndarray,
     targets: jnp.ndarray,
     mask: jnp.ndarray,
     loss: jnp.ndarray,
     z_loss: Optional[jnp.ndarray] = None,
+    segment_ids: Optional[Mapping[str, jnp.ndarray]] = None,
 ) -> MetricsMap:
   """Compute summary metrics.
 
@@ -1129,7 +1192,8 @@ def compute_base_metrics(
      values (float-valued weights not supported).
    loss: loss (float)
    z_loss: z_loss (float)
-
+   segment_ids: Optional dictionary of feature and value is the segment ids used
+     for packing, i.e. [batch, length] arrays.
   Returns:
     Dict of metrics.
   """
@@ -1167,7 +1231,7 @@ def compute_base_metrics(
       'timing/target_tokens_per_second_per_core':
           metrics_lib.TimeRate.from_model_output(numerator=num_tokens /
                                                  num_devices),
-      'nonpadding_fraction':
+      'non_padding_fraction/loss_weights':
           clu_metrics.Average(total=nonpadding_tokens, count=num_tokens),
   }
   if z_loss is not None:
@@ -1181,6 +1245,27 @@ def compute_base_metrics(
         'cross_ent_loss_per_all_target_tokens':
             clu_metrics.Average(total=jnp.sum(loss - z_loss), count=num_tokens)
     })
+
+  if segment_ids is not None:
+    total_tokens = 0
+    total_non_padding_tokens = 0
+    for feature, feature_segment_ids in segment_ids.items():
+      if feature_segment_ids is None or feature_segment_ids.shape[1] == 0:
+        continue
+      # Since this is [B, L] with the segment ids in axis = 1.
+      num_examples = count_packed_examples(feature_segment_ids)
+      metrics[f'effective_batch_size/{feature}'] = metrics_lib.AveragePerStep(
+          total=num_examples)
+      # 0s is padding
+      feature_non_padding = jnp.sum(feature_segment_ids != 0)
+      feature_size = feature_segment_ids.size
+      total_tokens += feature_size
+      total_non_padding_tokens += feature_non_padding
+      metrics[f'non_padding_fraction/{feature}'] = clu_metrics.Average(
+          total=feature_non_padding, count=feature_size)
+    metrics['non_padding_fraction/overall'] = clu_metrics.Average(
+        total=total_non_padding_tokens, count=total_tokens)
+
   return metrics
 
 

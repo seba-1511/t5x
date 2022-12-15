@@ -220,6 +220,7 @@ OPTAX_OPTIMIZER = None
 OPTAX_STATE = None
 
 
+@typing_extensions.runtime_checkable
 class TrainState(typing_extensions.Protocol):
   """TrainState interface."""
 
@@ -418,7 +419,7 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
     params['encoder']['prompt']['prompt'] = new_prompt
     params = flax.core.freeze(params)
 
-    new_state = self._optimizer.state.replace(step=self._optimizer.state.step+1)
+    new_state = self._optimizer.state.replace(step=self._optimizer.state.step + 1)
     new_optimizer = self._optimizer.replace(target=params, state=new_state)
 
     # the following should be our `OptaxOptimizer`, which does nothing.
