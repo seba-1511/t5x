@@ -32,6 +32,7 @@ import gin
 
 import tensorflow as tf
 import os
+import numpy as np
 import pickle
 from melodi.colabs.shared_code import datasets
 
@@ -200,7 +201,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
 
         def update(self, gradients, states, prompt):
             update = jax.tree_util.tree_map(
-                lambda x: x + self.noise * jnp.random.randn(*x.shape),
+                lambda x: x + self.noise * np.random.randn(*x.shape),
                 gradients,
             )
             new_states = []
