@@ -186,24 +186,56 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         def tree_unflatten(self, auxiliaries, contents):
             return ChainedOptimizer(auxiliaries[0])
 
+    # NOISY GRADIENTS DEFINITION
+
+    @jax.tree_util.register_pytree_node_class
+    class NoisyGradients:
+
+        def __init__(self, noise):
+            self.noise = noise
+
+        def init(self, prompt):
+            state = []
+            return state
+
+        def update(self, gradients, states, prompt):
+            update = jax.tree_util.tree_map(
+                lambda x: x + self.noise * jnp.random.randn(*x.shape),
+                gradients,
+            )
+            new_states = []
+            return update, new_states
+
+        def tree_flatten(self):
+            contents = []
+            auxiliaries = [self.noise, ]
+            return contents, auxiliaries
+
+        @classmethod
+        def tree_unflatten(self, auxiliaries, contents):
+            return NoisyGradients(auxiliaries[0])
+
+
     if optimizer_name == 'melodi':
         return ChainedOptimizer((melodi_optimizer, heavyball))
     elif optimizer_name == 'heavyball':
         return heavyball
     elif optimizer_name == 'adafactor':
         return adafactor
+    elif optimizer_name == 'adafactor-noisy':
+        return ChainedOptimizer((NoisyGradients(8e-4), adafactor))
     elif optimizer_name == 'melofactor':
         return ChainedOptimizer((melodi_optimizer, adafactor))
     raise ValueError('Unknown optimizer =' + optimizer_name)
 
-# Has to be on GPU when call from host_callback, else deadlocks
+# Has to be on CPU when call from host_callback, else deadlocks
 # when allocating new tensors.
 @functools.partial(jax.jit, backend='cpu', static_argnames=['optimizer'])
 def optax_init(prompt, optimizer):
     return jax.device_get(optimizer.init(prompt))
 
 
-# Has to be on GPU when call from host_callback, else deadlocks
+# Has to be on CPU when call from host_callback, else deadlocks
 # when allocating new tensors.
 @functools.partial(jax.jit, backend='cpu', static_argnames=['optimizer'])
 def optax_update(prompt, grads, state, optimizer):
