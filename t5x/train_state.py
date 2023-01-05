@@ -47,7 +47,7 @@ VariableDict = flax_scope.VariableDict
 
 #  @functools.partial(jax.jit, backend='cpu')
 @gin.configurable
-def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3, momentum=0.0, melodi_memory=256):
+def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3, momentum=0.0, melodi_memory=256, melodi_model='gradient'):
 
     if optimizer_name is None:
         optimizer_name = 'adafactor'
@@ -94,19 +94,27 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         one_hot=True,
         name='token_embedder',
     )
-    transformer = optimizers.DecoderOnlyOptimizer(
-        model=t5_common_layers.decoder(
-            num_heads=6,
-            head_dim=64,
-            mlp_dim=1024,
-            num_layers=8,
-            shared_token_embedder=embedder,
-            dropout_rate=0.0,
-            activations=('gelu', 'linear'),
-        )
+    transformer = t5_common_layers.decoder(
+        num_heads=6,
+        head_dim=64,
+        mlp_dim=1024,
+        num_layers=8,
+        shared_token_embedder=embedder,
+        dropout_rate=0.0,
+        activations=('gelu', 'linear'),
     )
     transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
-    optimizer = optimizers.GradientOptimizer(model=transformer)
+    if melodi_model == 'gradient':
+        optimizer = optimizers.GradientOptimizer(
+            model=optimizers.DecoderOnlyOptimizer(model=transformer),
+        )
+    elif melodi_model == 'multi_timescale':
+        optimizer = optimizers.GradientMultiTimescaleOptimizer(
+            model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
+            add_segment_embeddings=True,
+            add_separator_embeddings=False,
+            include_prompt_id=True,
+        )
 
     #  if False: # random parameters
         #  rng = jax.random.PRNGKey(1234)
