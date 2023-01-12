@@ -119,7 +119,7 @@ def train(
     run_eval_before_training: bool = False,
     train_state_initializer_cls: Type[
         utils.TrainStateInitializer] = utils.TrainStateInitializer,
-    use_gda: bool = True,
+    use_gda: bool = False,
     use_jax_array: bool = False,
     use_orbax: bool = False,
     verify_matching_vocabs_fn: Optional[
