@@ -104,7 +104,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         activations=('gelu', 'linear'),
     )
     transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
-    if melodi_model == 'gradient':
+    if melodi_model == 'gradients':
         optimizer = optimizers.GradientOptimizer(
             model=optimizers.DecoderOnlyOptimizer(model=transformer),
         )
