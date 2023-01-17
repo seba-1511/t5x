@@ -195,6 +195,41 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         def tree_unflatten(self, auxiliaries, contents):
             return ChainedOptimizer(auxiliaries[0])
 
+    @jax.tree_util.register_pytree_node_class
+    class EnsembleOptimizer:
+
+        def __init__(self, optimizers):
+            self.optimizers = optimizers
+            self.num_optimizers = len(optimizers)
+
+        def init(self, prompt):
+            state = []
+            for opt in self.optimizers:
+                state.append(opt.init(prompt))
+            return state
+
+        def update(self, gradients, states, prompt):
+            update = jax.tree_util.tree_map(lambda g: 0.0, gradients)
+            new_states = []
+            for opt, state in zip(self.optimizers, states):
+                opt_update, new_state = opt.update(gradients, state, prompt)
+                update = jax.tree_util.tree_map(
+                    lambda u, g: u + g / self.num_optimizers,
+                    update,
+                    opt_update,
+                )
+                new_states.append(new_state)
+            return update, new_states
+
+        def tree_flatten(self):
+            contents = []
+            auxiliaries = [self.optimizers, ]
+            return contents, auxiliaries
+
+        @classmethod
+        def tree_unflatten(self, auxiliaries, contents):
+            return ChainedOptimizer(auxiliaries[0])
+
     # NOISY GRADIENTS DEFINITION
 
     @jax.tree_util.register_pytree_node_class
@@ -233,6 +268,8 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         return adafactor
     elif optimizer_name == 'adafactor-noisy':
         return ChainedOptimizer((NoisyGradients(8e-4), adafactor))
+    elif optimizer_name == 'adafactor+melodi':
+        return EnsembleOptimizer((melodi_optimizer, adafactor))
     elif optimizer_name == 'melofactor':
         return ChainedOptimizer((melodi_optimizer, adafactor))
     raise ValueError('Unknown optimizer =' + optimizer_name)
