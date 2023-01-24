@@ -270,6 +270,8 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         return ChainedOptimizer((NoisyGradients(8e-4), adafactor))
     elif optimizer_name == 'adafactor+melodi':
         return EnsembleOptimizer((melodi_optimizer, adafactor))
+    elif optimizer_name == 'adafactor+adafactor':
+        return EnsembleOptimizer((adafactor, adafactor))
     elif optimizer_name == 'melofactor':
         return ChainedOptimizer((melodi_optimizer, adafactor))
     raise ValueError('Unknown optimizer =' + optimizer_name)
