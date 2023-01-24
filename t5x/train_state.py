@@ -108,6 +108,20 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         optimizer = optimizers.GradientOptimizer(
             model=optimizers.DecoderOnlyOptimizer(model=transformer),
         )
+    elif melodi_model == 'base-gradients':
+        transformer = t5_common_layers.decoder(
+            num_heads=12,
+            head_dim=64,
+            mlp_dim=2048,
+            num_layers=12,
+            shared_token_embedder=embedder,
+            dropout_rate=0.0,
+            activations=('gelu', 'linear'),
+        )
+        transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
+        optimizer = optimizers.GradientOptimizer(
+            model=optimizers.DecoderOnlyOptimizer(model=transformer),
+        )
     elif melodi_model == 'multi_timescale':
         optimizer = optimizers.GradientMultiTimescaleOptimizer(
             model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
