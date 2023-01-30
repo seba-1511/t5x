@@ -502,10 +502,9 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
         OPTAX_STATE = state
         return new_prompt
 
-    args = (
-        self._optimizer.target['encoder']['prompt']['prompt'],
-        grads['encoder']['prompt']['prompt'],
-    )
+    prompt = self._optimizer.target['encoder']['prompt']['prompt']
+    grads = grads['encoder']['prompt']['prompt']
+    args = (prompt, grads)
     new_prompt = hcb.call(local_update, args, result_shape=args[1])
 
     params = self._optimizer.target
@@ -513,12 +512,22 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
     params['encoder']['prompt']['prompt'] = new_prompt
     params = flax.core.freeze(params)
 
+    # only works because grads and prompt have a single matrix
+    grads_norm = sum(jax.tree_util.tree_leaves(jax.tree_util.tree_map(
+        jax.numpy.linalg.norm,
+        grads
+    )))
+    update_norm = sum(jax.tree_util.tree_leaves(jax.tree_util.tree_map(
+        jax.numpy.linalg.norm,
+        jax.tree_util.tree_map(lambda n, p: n-p, new_prompt, prompt)
+    )))
+
     new_state = self._optimizer.state.replace(step=self._optimizer.state.step + 1)
     new_optimizer = self._optimizer.replace(target=params, state=new_state)
 
     # the following should be our `OptaxOptimizer`, which does nothing.
     #  new_optimizer = self._optimizer.apply_gradient(grads, learning_rate=learning_rate)
-    return self.replace(_optimizer=new_optimizer, flax_mutables=flax_mutables)
+    return self.replace(_optimizer=new_optimizer, flax_mutables=flax_mutables), grads_norm, update_norm
 
   def replace_params(self, params: VariableDict) -> 'FlaxOptimTrainState':
     return self.replace(_optimizer=self._optimizer.replace(target=params))
