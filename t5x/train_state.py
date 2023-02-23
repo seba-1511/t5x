@@ -26,9 +26,12 @@ import jax.numpy as jnp
 from t5x import optimizers
 
 import jax
-import optax
 import functools
 import gin
+import optax
+from optax._src import base as optax_base, linear_algebra as optax_la
+
+
 
 import tensorflow as tf
 import os
@@ -180,6 +183,26 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         momentum=momentum,
     )
 
+    # NORMALIZED HEAVYBALL DEFINITION
+    def normalize_update(norm: float = 1.0):
+
+        def init_fn(params):
+            return optax_base.EmptyState()
+
+        def update_fn(updates, state, params=None):
+            g_norm = optax_la.global_norm(updates)
+            updates = jax.tree_util.tree_map(
+                lambda g: g / g_norm.astype(g.dtype),
+                updates,
+            )
+            return updates, state
+        return optax_base.GradientTransformation(init_fn, update_fn)
+
+    normalized_heavyball = optax.chain(
+        normalize_update(1.0),
+        optax.sgd(learning_rate=learning_rate, momentum=momentum),
+    )
+
     @jax.tree_util.register_pytree_node_class
     class ChainedOptimizer:
 
@@ -278,6 +301,8 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         return ChainedOptimizer((melodi_optimizer, heavyball))
     elif optimizer_name == 'heavyball':
         return heavyball
+    elif optimizer_name == 'normalized_heavyball':
+        return normalized_heavyball
     elif optimizer_name == 'adafactor':
         return adafactor
     elif optimizer_name == 'adafactor-noisy':
