@@ -173,6 +173,30 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         factored=True,
     )
 
+    # PRECOMPUTED OPTIMIZER
+
+    class PrecomputedOptimizer:
+
+        def __init__(self, path):
+            self.path = path
+            # TODO: load all paths
+
+        def init(self, prompt):
+            return {'step': 0}
+
+        def update(self, gradients, states, prompt):
+            pass
+
+        def tree_flatten(self):
+            contents = []
+            auxiliaries = [self.path, ]
+            return contents, auxiliaries
+
+        @classmethod
+        def tree_unflatten(self, auxiliaries, contents):
+            return PrecomputedOptimizer(auxiliaries[0])
+
+
     # HEAVYBALL DEFINITION
 
     heavyball = optax.sgd(
