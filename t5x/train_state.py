@@ -26,9 +26,14 @@ import jax.numpy as jnp
 from t5x import optimizers
 
 import jax
-import optax
+import jax.experimental.host_callback as hcb
+
 import functools
 import gin
+import optax
+from optax._src import base as optax_base, linear_algebra as optax_la
+
+
 
 import tensorflow as tf
 import os
@@ -49,13 +54,6 @@ VariableDict = flax_scope.VariableDict
 @gin.configurable
 def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3, momentum=0.0, melodi_memory=256, melodi_model='gradient'):
 
-    if optimizer_name is None:
-        optimizer_name = 'adafactor'
-    if momentum == 0.0:
-        momentum = None
-    if melodi_path is None:
-        melodi_path = 'gs://melodi-bucket0/melodi_training/task=glue_mnli_and_dev_v002/horizon=32/memory=256/bsz=64/lr=5e-5'
-
     import jax
     import optax
     import numpy as np
@@ -64,6 +62,60 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
     from melodi.colabs.shared_code import models
 
     from flaxformer.architectures.t5 import t5_common_layers
+
+    if optimizer_name is None:
+        optimizer_name = 'adafactor'
+    if momentum == 0.0:
+        momentum = None
+    if melodi_path is None:
+        melodi_path = 'gs://melodi-bucket0/melodi_training/task=glue_mnli_and_dev_v002/horizon=32/memory=256/bsz=64/lr=5e-5'
+
+    # PRECOMPUTED OPTIMIZER
+
+    class PrecomputedOptimizer:
+
+        def __init__(self, path):
+            self.path = path
+            self.all_updates = []
+            index = 0
+            while True:
+                update_path = os.path.join(path, f'update_{index}.pkl')
+                if not tf.io.gfile.exists(update_path):
+                    break
+                # load all paths
+                with tf.io.gfile.GFile(name=update_path, mode='rb') as f:
+                    update = pickle.loads(f.read())
+                self.all_updates.append(update)
+                index += 1
+            self.get_update = jax.jit(lambda idx, updates: updates[idx], static_argnums=0)
+
+        def init(self, prompt):
+            return {'step': 0}
+
+        def update(self, gradients, states, prompt):
+            # Requires a callback for indexing.
+            #  def fetch_update(*args): return args[0][0][args[0][1]]
+            #  args = (self.all_updates, states['step'])
+            #  update = hcb.call(fetch_update, args, result_shape=args[0][0])
+            update = self.get_update(states['step'], self.all_updates)
+            new_update = - prompt + update['params'] - learning_rate * update['update']
+            states['step'] += 1
+            return new_update, states
+
+        def tree_flatten(self):
+            contents = []
+            auxiliaries = [self.path, ]
+            return contents, auxiliaries
+
+        @classmethod
+        def tree_unflatten(self, auxiliaries, contents):
+            return PrecomputedOptimizer(auxiliaries[0])
+
+    if optimizer_name == 'precomputed_optimizer':
+        return PrecomputedOptimizer(melodi_path)
+
+
+    # MELODI OPTIMIZER
 
     #  if optimizer is None:
         #  return optax.sgd(
@@ -219,6 +271,26 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         momentum=momentum,
     )
 
+    # NORMALIZED HEAVYBALL DEFINITION
+    def normalize_update(norm: float = 1.0):
+
+        def init_fn(params):
+            return optax_base.EmptyState()
+
+        def update_fn(updates, state, params=None):
+            g_norm = optax_la.global_norm(updates)
+            updates = jax.tree_util.tree_map(
+                lambda g: g / g_norm.astype(g.dtype),
+                updates,
+            )
+            return updates, state
+        return optax_base.GradientTransformation(init_fn, update_fn)
+
+    normalized_heavyball = optax.chain(
+        normalize_update(1.0),
+        optax.sgd(learning_rate=learning_rate, momentum=momentum),
+    )
+
     @jax.tree_util.register_pytree_node_class
     class ChainedOptimizer:
 
@@ -317,6 +389,8 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         return ChainedOptimizer((melodi_optimizer, heavyball))
     elif optimizer_name == 'heavyball':
         return heavyball
+    elif optimizer_name == 'normalized_heavyball':
+        return normalized_heavyball
     elif optimizer_name == 'adafactor':
         return adafactor
     elif optimizer_name == 'velo':
@@ -520,8 +594,6 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
                      learning_rate,
                      loss,
                      flax_mutables=EMPTY_DICT) -> 'FlaxOptimTrainState':
-
-    import jax.experimental.host_callback as hcb
 
     def local_update(*args):
 
