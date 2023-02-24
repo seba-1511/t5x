@@ -54,6 +54,15 @@ VariableDict = flax_scope.VariableDict
 @gin.configurable
 def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3, momentum=0.0, melodi_memory=256, melodi_model='gradient'):
 
+    import jax
+    import optax
+    import numpy as np
+
+    from melodi.colabs.shared_code import optimizers
+    from melodi.colabs.shared_code import models
+
+    from flaxformer.architectures.t5 import t5_common_layers
+
     if optimizer_name is None:
         optimizer_name = 'adafactor'
     if momentum == 0.0:
@@ -78,15 +87,17 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
                     update = pickle.loads(f.read())
                 self.all_updates.append(update)
                 index += 1
+            self.get_update = jax.jit(lambda idx, updates: updates[idx], static_argnums=0)
 
         def init(self, prompt):
             return {'step': 0}
 
         def update(self, gradients, states, prompt):
-            # TODO: Requires a callback for indexing.
-            def fetch_update(*args): return args[0][0][args[0][1]]
-            args = (self.all_updates, states['step'])
-            update = hcb.call(fetch_update, args, result_shape=args[0][0])
+            # Requires a callback for indexing.
+            #  def fetch_update(*args): return args[0][0][args[0][1]]
+            #  args = (self.all_updates, states['step'])
+            #  update = hcb.call(fetch_update, args, result_shape=args[0][0])
+            update = self.get_update(states['step'], self.all_updates)
             new_update = - prompt + update['params'] - learning_rate * update['update']
             states['step'] += 1
             return new_update, states
@@ -105,15 +116,6 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
 
 
     # MELODI OPTIMIZER
-
-    import jax
-    import optax
-    import numpy as np
-
-    from melodi.colabs.shared_code import optimizers
-    from melodi.colabs.shared_code import models
-
-    from flaxformer.architectures.t5 import t5_common_layers
 
     #  if optimizer is None:
         #  return optax.sgd(
