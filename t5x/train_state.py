@@ -26,6 +26,8 @@ import jax.numpy as jnp
 from t5x import optimizers
 
 import jax
+import jax.experimental.host_callback as hcb
+
 import functools
 import gin
 import optax
@@ -58,6 +60,51 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         momentum = None
     if melodi_path is None:
         melodi_path = 'gs://melodi-bucket0/melodi_training/task=glue_mnli_and_dev_v002/horizon=32/memory=256/bsz=64/lr=5e-5'
+
+    # PRECOMPUTED OPTIMIZER
+
+    class PrecomputedOptimizer:
+
+        def __init__(self, path):
+            self.path = path
+            self.all_updates = []
+            index = 0
+            while True:
+                update_path = os.path.join(path, f'update_{index}.pkl')
+                if not tf.io.gfile.exists(update_path):
+                    break
+                # load all paths
+                with tf.io.gfile.GFile(name=update_path, mode='rb') as f:
+                    update = pickle.loads(f.read())
+                self.all_updates.append(update)
+                index += 1
+
+        def init(self, prompt):
+            return {'step': 0}
+
+        def update(self, gradients, states, prompt):
+            # TODO: Requires a callback for indexing.
+            def fetch_update(*args): return args[0][0][args[0][1]]
+            args = (self.all_updates, states['step'])
+            update = hcb.call(fetch_update, args, result_shape=args[0][0])
+            new_update = - prompt + update['params'] - learning_rate * update['update']
+            states['step'] += 1
+            return new_update, states
+
+        def tree_flatten(self):
+            contents = []
+            auxiliaries = [self.path, ]
+            return contents, auxiliaries
+
+        @classmethod
+        def tree_unflatten(self, auxiliaries, contents):
+            return PrecomputedOptimizer(auxiliaries[0])
+
+    if optimizer_name == 'precomputed_optimizer':
+        return PrecomputedOptimizer(melodi_path)
+
+
+    # MELODI OPTIMIZER
 
     import jax
     import optax
@@ -175,30 +222,6 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         eps=1e-30,
         factored=True,
     )
-
-    # PRECOMPUTED OPTIMIZER
-
-    class PrecomputedOptimizer:
-
-        def __init__(self, path):
-            self.path = path
-            # TODO: load all paths
-
-        def init(self, prompt):
-            return {'step': 0}
-
-        def update(self, gradients, states, prompt):
-            pass
-
-        def tree_flatten(self):
-            contents = []
-            auxiliaries = [self.path, ]
-            return contents, auxiliaries
-
-        @classmethod
-        def tree_unflatten(self, auxiliaries, contents):
-            return PrecomputedOptimizer(auxiliaries[0])
-
 
     # HEAVYBALL DEFINITION
 
@@ -519,8 +542,6 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
                      grads,
                      learning_rate,
                      flax_mutables=EMPTY_DICT) -> 'FlaxOptimTrainState':
-
-    import jax.experimental.host_callback as hcb
 
     def local_update(*args):
 
