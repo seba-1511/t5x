@@ -772,7 +772,7 @@ def apply_grads(
     other_state_variables = {}
   # Update optimizer using accumulated gradient.
   new_train_state, grads_norm, update_norm = train_state.apply_gradient(
-      grad_accum, learning_rate=learning_rate, **other_state_variables)
+      grad_accum, learning_rate=learning_rate, loss=metrics['loss'], **other_state_variables)
   metrics["grads_norm"] = clu.metrics.Average.from_model_output(
       jnp.asarray([grads_norm]))
   metrics["update_norm"] = clu.metrics.Average.from_model_output(
