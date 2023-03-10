@@ -225,6 +225,45 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         factored=True,
     )
 
+    # VeLO DEFINITION
+
+    if 'velo' in optimizer_name:
+        from learned_optimization.research.general_lopt import prefab
+        velo_opt = prefab.optax_lopt(5000)
+
+        @jax.tree_util.register_pytree_node_class
+        class VeLOOptimizer:
+
+            def __init__(self):
+                self.opt = velo_opt # 5000 optimization steps
+                self.is_velo = True
+
+            def init(self, prompt):
+                return None
+                #  return self.opt.init(prompt)
+
+            def update(self, gradients, states, prompt, extra_args):
+                return jax.tree_util.tree_map(lambda x: -0.1 * x, gradients), None
+                #  return self.opt.update(gradients, states, params=prompt, extra_args=extra_args)
+                #  # quadratic approximation for now
+                #  loss = 0.5 * sum(jax.tree_util.tree_leaves(jax.tree_util.tree_map(
+                    #  jax.numpy.linalg.norm,
+                    #  gradients
+                #  )))
+                #  return self.opt.update(gradients, states, params=prompt, extra_args={"loss": loss})
+
+            def tree_flatten(self):
+                contents = []
+                auxiliaries = []
+                return contents, auxiliaries
+
+            @classmethod
+            def tree_unflatten(self, auxiliaries, contents):
+                return VeLOOptimizer()
+
+
+        velo = VeLOOptimizer()
+
     # HEAVYBALL DEFINITION
 
     heavyball = optax.sgd(
@@ -392,6 +431,8 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         return normalized_heavyball
     elif optimizer_name == 'adafactor':
         return adafactor
+    elif optimizer_name == 'velo':
+        return velo
     elif optimizer_name == 'adafactor-noisy':
         return ChainedOptimizer((NoisyGradients(8e-4), adafactor))
     elif optimizer_name == 'adafactor+melodi':
@@ -414,12 +455,20 @@ def optax_init(prompt, optimizer):
 # Has to be on CPU when call from host_callback, else deadlocks
 # when allocating new tensors.
 @functools.partial(jax.jit, backend='cpu', static_argnames=['optimizer'])
-def optax_update(prompt, grads, state, optimizer):
-    update, new_state = optimizer.update(
-        grads,
-        state,
-        prompt,
-    )
+def optax_update(prompt, grads, state, loss, optimizer):
+    if hasattr(optimizer, 'is_velo') and optimizer.is_velo:
+        update, new_state = optimizer.update(
+            grads,
+            state,
+            prompt,
+            extra_args={'loss': loss},
+        )
+    else:
+        update, new_state = optimizer.update(
+            grads,
+            state,
+            prompt,
+        )
     new_prompt = optax.apply_updates(prompt, update)
     return new_prompt, new_state
 
@@ -583,6 +632,7 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
   def apply_gradient(self,
                      grads,
                      learning_rate,
+                     loss,
                      flax_mutables=EMPTY_DICT) -> 'FlaxOptimTrainState':
 
     def local_update(*args):
@@ -596,6 +646,7 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
         # unpack
         prompt = jax.device_get(args[0][0])['prompt']
         grads = jax.device_get(args[0][1])['prompt']
+        loss = jax.device_get(args[0][2])
 
         if OPTAX_STATE is None:
             OPTAX_STATE = optax_init(prompt, optimizer=OPTAX_OPTIMIZER)
@@ -606,6 +657,7 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
             prompt=prompt,
             grads=grads,
             state=state,
+            loss=loss,
             optimizer=OPTAX_OPTIMIZER,
         )
         new_prompt = flax.core.freeze({'prompt': new_prompt})
@@ -616,7 +668,7 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
 
     prompt = self._optimizer.target['encoder']['prompt']['prompt']
     grads = grads['encoder']['prompt']['prompt']
-    args = (prompt, grads)
+    args = (prompt, grads, loss)
     new_prompt = hcb.call(local_update, args, result_shape=args[1])
 
     params = self._optimizer.target
