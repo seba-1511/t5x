@@ -253,6 +253,44 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
     )
 
     @jax.tree_util.register_pytree_node_class
+    class SwitchingOptimizer:
+
+        def __init__(self, opt1, opt2, switch_step=50):
+            self.opt1 = opt1
+            self.opt2 = opt2
+            self.switch_step = switch_step
+
+        def init(self, prompt):
+            state = [{
+                'step': jax.numpy.zeros(1),
+                'switch': jax.numpy.zeros(1)+self.switch_step,
+            }]
+            state.append(self.opt1.init(prompt))
+            state.append(self.opt2.init(prompt))
+            return state
+
+        def update(self, gradients, states, prompt):
+            step = states[0]['step']
+            switch_step = states[0]['switch']
+            update2, opt2_state = self.opt2.update(gradients, states[2], prompt)
+            update1, opt1_state = self.opt1.update(gradients, states[1], prompt)
+            update = jax.numpy.where(step < switch_step, update1, update2)
+
+            new_states = [{'step': step+1, 'switch': switch_step}]
+            new_states.append(opt1_state)
+            new_states.append(opt2_state)
+            return update, new_states
+
+        def tree_flatten(self):
+            contents = []
+            auxiliaries = [self.opt1, self.opt2, self.switch_step]
+            return contents, auxiliaries
+
+        @classmethod
+        def tree_unflatten(self, auxiliaries, contents):
+            return ChainedOptimizer(auxiliaries[0], auxiliaries[1], auxiliaries[2])
+
+    @jax.tree_util.register_pytree_node_class
     class ChainedOptimizer:
 
         def __init__(self, optimizers):
@@ -362,6 +400,8 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         return EnsembleOptimizer((adafactor, adafactor))
     elif optimizer_name == 'melofactor':
         return ChainedOptimizer((melodi_optimizer, adafactor))
+    elif optimizer_name == 'melodi-adafactor-switch50':
+        return SwitchingOptimizer(melodi_optimizer, adafactor, switch_step=50)
     raise ValueError('Unknown optimizer =' + optimizer_name)
 
 # Has to be on CPU when call from host_callback, else deadlocks
