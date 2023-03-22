@@ -479,6 +479,8 @@ def optax_update(prompt, grads, state, loss, optimizer):
             state,
             prompt,
         )
+
+    # update state and return new prompt
     new_prompt = optax.apply_updates(prompt, update)
     return new_prompt, new_state
 
@@ -670,9 +672,8 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
             loss=loss,
             optimizer=OPTAX_OPTIMIZER,
         )
-        new_prompt = flax.core.freeze({'prompt': new_prompt})
 
-        # update state and return new prompt
+        new_prompt = flax.core.freeze({'prompt': new_prompt})
         OPTAX_STATE = state
         return new_prompt
 
