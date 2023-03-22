@@ -79,6 +79,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             self.all_updates = []
             index = 0
             while True:
+
                 update_path = os.path.join(path, f'update_{index}.pkl')
                 if not tf.io.gfile.exists(update_path):
                     break
@@ -87,6 +88,8 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
                     update = pickle.loads(f.read())
                 self.all_updates.append(update)
                 index += 1
+            #  self.params = np.vstack([u['params'] for u in self.all_updates])
+            #  self.updates = np.vstack([u['update'] for u in self.all_updates])
             self.get_update = jax.jit(lambda idx, updates: updates[idx], static_argnums=0)
 
         def init(self, prompt):
@@ -94,11 +97,18 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
 
         def update(self, gradients, states, prompt):
             # Requires a callback for indexing.
-            #  def fetch_update(*args): return args[0][0][args[0][1]]
-            #  args = (self.all_updates, states['step'])
-            #  update = hcb.call(fetch_update, args, result_shape=args[0][0])
-            update = self.get_update(states['step'], self.all_updates)
-            new_update = - prompt + update['params'] - learning_rate * update['update']
+
+            def fetch_update(*args): return args[0][0][args[0][1]]
+            args = (self.all_updates, states['step'])
+            update = hcb.call(fetch_update, args, result_shape=args[0][0])
+
+            #  update = self.get_update(states['step'], self.all_updates)
+            new_update = - prompt + update['params'] + learning_rate * update['update']
+
+            #  params = self.params[states['step']]
+            #  update = self.update[states['step']]
+            #  new_update = - prompt + params - learning_rate * update
+
             states['step'] += 1
             return new_update, states
 
