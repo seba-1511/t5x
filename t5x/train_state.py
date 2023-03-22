@@ -94,11 +94,14 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
 
         def update(self, gradients, states, prompt):
             # Requires a callback for indexing.
-            #  def fetch_update(*args): return args[0][0][args[0][1]]
-            #  args = (self.all_updates, states['step'])
-            #  update = hcb.call(fetch_update, args, result_shape=args[0][0])
-            update = self.get_update(states['step'], self.all_updates)
-            new_update = - prompt + update['params'] - learning_rate * update['update']
+
+            def fetch_update(*args): return args[0][0][args[0][1]]
+            args = (self.all_updates, states['step'])
+            update = hcb.call(fetch_update, args, result_shape=args[0][0])
+
+            #  update = self.get_update(states['step'], self.all_updates)
+            new_update = - prompt + update['params'] + learning_rate * update['update']
+
             states['step'] += 1
             return new_update, states
 
@@ -469,6 +472,8 @@ def optax_update(prompt, grads, state, loss, optimizer):
             state,
             prompt,
         )
+
+    # update state and return new prompt
     new_prompt = optax.apply_updates(prompt, update)
     return new_prompt, new_state
 
@@ -660,9 +665,8 @@ class FlaxOptimTrainState(flax.struct.PyTreeNode):
             loss=loss,
             optimizer=OPTAX_OPTIMIZER,
         )
-        new_prompt = flax.core.freeze({'prompt': new_prompt})
 
-        # update state and return new prompt
+        new_prompt = flax.core.freeze({'prompt': new_prompt})
         OPTAX_STATE = state
         return new_prompt
 
