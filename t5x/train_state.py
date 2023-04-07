@@ -103,7 +103,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             update = hcb.call(fetch_update, args, result_shape=args[0][0])
 
             #  update = self.get_update(states['step'], self.all_updates)
-            new_update = - prompt + update['params'] + learning_rate * update['update']
+            new_update = - prompt + update['params'] - learning_rate * update['update']
 
             #  params = self.params[states['step']]
             #  update = self.update[states['step']]
