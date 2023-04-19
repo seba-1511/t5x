@@ -316,8 +316,6 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
 
     # get parameters
     parameters = checkpoint['params']
-    if 'xl' in melodi_model:
-        parameters = jax.tree_util.tree_map(lambda x: x.astype(np.float16), parameters)
 
     # get preprocessor
     preprocessor = datasets.DatasetPreprocessor()
