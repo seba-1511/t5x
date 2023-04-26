@@ -170,6 +170,10 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         optimizer = optimizers.GradientOptimizer(
             model=optimizers.DecoderOnlyOptimizer(model=transformer),
         )
+    elif melodi_model == 'gradients-multitoken':
+        optimizer = optimizers.GradientOptimizer(
+            model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
+        )
     elif melodi_model == 'base-gradients':
         transformer = t5_common_layers.decoder(
             num_heads=12,
@@ -323,12 +327,20 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
     preprocessor = datasets.DatasetPreprocessor()
     preprocessor.set_state(checkpoint['preprocessor'])
 
-    melodi_optimizer = optimizers.PerTokenOptaxWrapper(
-        optimizer,
-        parameters,
-        memory=melodi_memory,
-        preprocessor=preprocessor,
-    )
+    if 'multitoken' in melodi_model:
+        melodi_optimizer = optimizers.MultiTokenOptaxWrapper(
+            optimizer,
+            parameters,
+            memory=melodi_memory,
+            preprocessor=preprocessor,
+        )
+    else:
+        melodi_optimizer = optimizers.PerTokenOptaxWrapper(
+            optimizer,
+            parameters,
+            memory=melodi_memory,
+            preprocessor=preprocessor,
+        )
 
     # ADAFACTOR DEFINITION:
 
