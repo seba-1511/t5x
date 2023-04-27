@@ -174,7 +174,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         optimizer = optimizers.GradientOptimizer(
             model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
         )
-    elif melodi_model == 'base-gradients':
+    elif'base-gradients' in melodi_model:
         transformer = t5_common_layers.decoder(
             num_heads=12,
             head_dim=64,
@@ -185,9 +185,14 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             activations=('gelu', 'linear'),
         )
         transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
-        optimizer = optimizers.GradientOptimizer(
-            model=optimizers.DecoderOnlyOptimizer(model=transformer),
-        )
+        if 'multitoken' in melodi_model:
+            optimizer = optimizers.GradientOptimizer(
+                model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
+            )
+        else:
+            optimizer = optimizers.GradientOptimizer(
+                model=optimizers.DecoderOnlyOptimizer(model=transformer),
+            )
     elif melodi_model == 'base-gradients-projected':
         embedder = models.NoOpEmbedder(
             num_embeddings=1,
