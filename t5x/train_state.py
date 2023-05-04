@@ -193,6 +193,42 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             optimizer = optimizers.GradientOptimizer(
                 model=optimizers.DecoderOnlyOptimizer(model=transformer),
             )
+    elif melodi_model == 'gradients-multitoken-projected':
+        embedder = models.NoOpEmbedder(
+            num_embeddings=1,
+            features=1024,
+            one_hot=True,
+            name='token_embedder',
+        )
+        transformer = t5_common_layers.decoder(
+            num_heads=6,
+            head_dim=64,
+            mlp_dim=1024,
+            num_layers=8,
+            shared_token_embedder=embedder,
+            dropout_rate=0.0,
+            activations=('gelu', 'linear'),
+        )
+        encoder = flax.linen.Dense(
+            use_bias=False,
+            features=1024,
+            kernel_init=flax.linen.initializers.xavier_uniform(),
+        )
+        decoder = flax.linen.Dense(
+            use_bias=False,
+            features=N_FEATURES,
+            kernel_init=flax.linen.initializers.xavier_uniform(),
+        )
+        transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
+        encoder = jax.tree_util.tree_map(lambda x: jax.device_get(x), encoder)
+        decoder = jax.tree_util.tree_map(lambda x: jax.device_get(x), decoder)
+        optimizer = optimizers.GradientOptimizer(
+            model=optimizers.ProjectedSequenceModelDecoderOnlyOptimizer(
+                model=transformer,
+                encoder=encoder,
+                decoder=decoder,
+            ),
+        )
     elif melodi_model == 'base-gradients-projected':
         embedder = models.NoOpEmbedder(
             num_embeddings=1,
