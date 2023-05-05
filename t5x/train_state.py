@@ -174,25 +174,6 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         optimizer = optimizers.GradientOptimizer(
             model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
         )
-    elif'base-gradients' in melodi_model:
-        transformer = t5_common_layers.decoder(
-            num_heads=12,
-            head_dim=64,
-            mlp_dim=2048,
-            num_layers=12,
-            shared_token_embedder=embedder,
-            dropout_rate=0.0,
-            activations=('gelu', 'linear'),
-        )
-        transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
-        if 'multitoken' in melodi_model:
-            optimizer = optimizers.GradientOptimizer(
-                model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
-            )
-        else:
-            optimizer = optimizers.GradientOptimizer(
-                model=optimizers.DecoderOnlyOptimizer(model=transformer),
-            )
     elif melodi_model == 'gradients-multitoken-projected':
         embedder = models.NoOpEmbedder(
             num_embeddings=1,
@@ -265,6 +246,61 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
                 decoder=decoder,
             ),
         )
+    elif melodi_model == 'base-gradients-multitoken-projected1024':
+        embedder = models.NoOpEmbedder(
+            num_embeddings=1,
+            features=1024,
+            one_hot=True,
+            name='token_embedder',
+        )
+        transformer = t5_common_layers.decoder(
+            num_heads=12,
+            head_dim=64,
+            mlp_dim=2048,
+            num_layers=12,
+            shared_token_embedder=embedder,
+            dropout_rate=0.0,
+            activations=('gelu', 'linear'),
+        )
+        encoder = flax.linen.Dense(
+            use_bias=False,
+            features=1024,
+            kernel_init=flax.linen.initializers.xavier_uniform(),
+        )
+        decoder = flax.linen.Dense(
+            use_bias=False,
+            features=N_FEATURES,
+            kernel_init=flax.linen.initializers.xavier_uniform(),
+        )
+        transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
+        encoder = jax.tree_util.tree_map(lambda x: jax.device_get(x), encoder)
+        decoder = jax.tree_util.tree_map(lambda x: jax.device_get(x), decoder)
+        optimizer = optimizers.GradientOptimizer(
+            model=optimizers.ProjectedSequenceModelDecoderOnlyOptimizer(
+                model=transformer,
+                encoder=encoder,
+                decoder=decoder,
+            ),
+        )
+    elif 'base-gradients' in melodi_model:
+        transformer = t5_common_layers.decoder(
+            num_heads=12,
+            head_dim=64,
+            mlp_dim=2048,
+            num_layers=12,
+            shared_token_embedder=embedder,
+            dropout_rate=0.0,
+            activations=('gelu', 'linear'),
+        )
+        transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
+        if 'multitoken' in melodi_model:
+            optimizer = optimizers.GradientOptimizer(
+                model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
+            )
+        else:
+            optimizer = optimizers.GradientOptimizer(
+                model=optimizers.DecoderOnlyOptimizer(model=transformer),
+            )
     elif melodi_model == 'large-gradients-projected':
         embedder = models.NoOpEmbedder(
             num_embeddings=1,
