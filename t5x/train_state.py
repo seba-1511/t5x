@@ -315,6 +315,13 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         optimizer = optimizers.ParameterOptimizer(
             model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
         )
+    elif melodi_model == 'small-parameters-gradients-multitoken':
+        transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
+        optimizer = optimizers.ParameterGradientOptimizer(
+            model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
+            interleave=True,
+            gradients_first=True,
+        )
     elif melodi_model == 'base-parameters-gradients-multitoken':
         transformer = t5_common_layers.decoder(
             num_heads=12,
