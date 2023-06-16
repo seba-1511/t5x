@@ -573,7 +573,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             # update opt2_state every `opt2_interval` steps
             opt2_state = jax.numpy.where(step >= switch_step or step % opt2_interval == 0, opt2_state, states[2])
 
-            new_states = [{'step': step+1, 'switch': switch_step}]
+            new_states = [{'step': step+1, 'switch': switch_step, 'opt2_interval': opt2_interval}]
             new_states.append(opt1_state)
             new_states.append(opt2_state)
             return update, new_states
