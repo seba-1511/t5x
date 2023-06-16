@@ -465,7 +465,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
     # ADAFACTOR DEFINITION:
 
     adafactor = optax.adafactor(
-        learning_rate=learning_rate,
+        learning_rate=0.3,
         min_dim_size_to_factor=128,
         decay_rate=0.8,
         decay_offset=-1100000,
@@ -546,15 +546,17 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
     @jax.tree_util.register_pytree_node_class
     class SwitchingOptimizer:
 
-        def __init__(self, opt1, opt2, switch_step=50):
+        def __init__(self, opt1, opt2, switch_step=50, opt2_interval=1):
             self.opt1 = opt1
             self.opt2 = opt2
             self.switch_step = switch_step
+            self.opt2_interval = opt2_interval
 
         def init(self, prompt):
             state = [{
                 'step': jax.numpy.zeros(1),
-                'switch': jax.numpy.zeros(1)+self.switch_step,
+                'switch': jax.numpy.zeros(1) + self.switch_step,
+                'opt2_interval': jax.numpy.zeros(1) + self.opt2_interval,
             }]
             state.append(self.opt1.init(prompt))
             state.append(self.opt2.init(prompt))
@@ -563,9 +565,13 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         def update(self, gradients, states, prompt):
             step = states[0]['step']
             switch_step = states[0]['switch']
+            opt2_interval = states[0]['opt2_interval']
             update2, opt2_state = self.opt2.update(gradients, states[2], prompt)
             update1, opt1_state = self.opt1.update(gradients, states[1], prompt)
             update = jax.numpy.where(step < switch_step, update1, update2)
+
+            # update opt2_state every `opt2_interval` steps
+            opt2_state = jax.numpy.where(step >= switch_step or step % opt2_interval == 0, opt2_state, states[2])
 
             new_states = [{'step': step+1, 'switch': switch_step}]
             new_states.append(opt1_state)
@@ -701,6 +707,8 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=50)
     elif optimizer_name == 'adafactor-melodi-switch100':
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=100)
+    elif optimizer_name == 'adafactor-melodi-switch100-h8':
+        return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=100, opt2_interval=8)
     raise ValueError('Unknown optimizer =' + optimizer_name)
 
 # Has to be on CPU when call from host_callback, else deadlocks
