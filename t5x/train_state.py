@@ -721,6 +721,8 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=100)
     elif optimizer_name == 'adafactor-melodi-switch100-h8':
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=100, opt2_interval=8)
+    elif optimizer_name == 'adafactor-melodi-switch130-h16':
+        return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=130, opt2_interval=16)
     raise ValueError('Unknown optimizer =' + optimizer_name)
 
 # Has to be on CPU when call from host_callback, else deadlocks
