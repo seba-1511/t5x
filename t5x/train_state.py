@@ -465,7 +465,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
     # ADAFACTOR DEFINITION:
 
     adafactor = optax.adafactor(
-        learning_rate=0.3,
+        learning_rate=learning_rate,
         min_dim_size_to_factor=128,
         decay_rate=0.8,
         decay_offset=-1100000,
