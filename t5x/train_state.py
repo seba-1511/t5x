@@ -566,14 +566,26 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             step = states[0]['step']
             switch_step = states[0]['switch']
             opt2_interval = states[0]['opt2_interval']
+
+            # compute updates
             update2, opt2_state = self.opt2.update(gradients, states[2], prompt)
             update1, opt1_state = self.opt1.update(gradients, states[1], prompt)
             update = jax.numpy.where(step < switch_step, update1, update2)
 
             # update opt2_state every `opt2_interval` steps
-            opt2_state = jax.numpy.where(step >= switch_step or step % opt2_interval == 0, opt2_state, states[2])
+            condition = jax.numpy.logical_or(step >= switch_step, step % opt2_interval == 0)
+            opt2_state = jax.tree_util.tree_map(
+                lambda x, y: jax.numpy.where(condition, x, y),
+                opt2_state,
+                states[2],
+            )
 
-            new_states = [{'step': step+1, 'switch': switch_step, 'opt2_interval': opt2_interval}]
+            # create new states
+            new_states = [{
+                'step': step+1,
+                'switch': switch_step,
+                'opt2_interval': opt2_interval,
+            }]
             new_states.append(opt1_state)
             new_states.append(opt2_state)
             return update, new_states
