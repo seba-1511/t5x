@@ -464,8 +464,11 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
 
     # ADAFACTOR DEFINITION:
 
+    # ******************************************************************************************
+    # ***************************** TODO: REVERT 0.3 TO LEARNING_RATE **************************
+    # ******************************************************************************************
     adafactor = optax.adafactor(
-        learning_rate=learning_rate,
+        learning_rate=0.3,
         min_dim_size_to_factor=128,
         decay_rate=0.8,
         decay_offset=-1100000,
@@ -554,9 +557,9 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
 
         def init(self, prompt):
             state = [{
-                'step': jax.numpy.zeros(1),
-                'switch': jax.numpy.zeros(1) + self.switch_step,
-                'opt2_interval': jax.numpy.zeros(1) + self.opt2_interval,
+                'step': jax.numpy.zeros((), dtype=jax.numpy.int32),
+                'switch': jax.numpy.zeros((), dtype=jax.numpy.int32) + self.switch_step,
+                'opt2_interval': jax.numpy.zeros((), dtype=jax.numpy.int32) + self.opt2_interval,
             }]
             state.append(self.opt1.init(prompt))
             state.append(self.opt2.init(prompt))
@@ -568,17 +571,22 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             opt2_interval = states[0]['opt2_interval']
 
             # compute updates
+            # jax.debug.print('***** switching step={x} *****', x=step)
+            # jax.debug.print('ante melodi step={x}', x=states[2]['step'])
+            # jax.debug.print('ante melodi step.shape={x}', x=states[2]['step'].shape)
             update2, opt2_state = self.opt2.update(gradients, states[2], prompt)
             update1, opt1_state = self.opt1.update(gradients, states[1], prompt)
             update = jax.numpy.where(step < switch_step, update1, update2)
+            # jax.debug.print('pre melodi step={x}', x=opt2_state['step'])
+            # jax.debug.print('pre melodi step.shape={x}', x=opt2_state['step'].shape)
 
             # update opt2_state every `opt2_interval` steps
             condition = jax.numpy.logical_or(step >= switch_step, step % opt2_interval == 0)
-            opt2_state = jax.tree_util.tree_map(
-                lambda x, y: jax.numpy.where(condition, x, y),
-                opt2_state,
-                states[2],
-            )
+            opt2_state = jax.lax.cond(condition, lambda: opt2_state, lambda: states[2])
+            # jax.debug.print('post melodi step={x}', x=opt2_state['step'])
+            # jax.debug.print('post melodi step.shape={x}', x=opt2_state['step'].shape)
+            # jax.debug.print('post melodi gradient_memory={x}', x=opt2_state['gradient_memory'][:, 0, 0, 0])
+            # jax.debug.print('')
 
             # create new states
             new_states = [{
