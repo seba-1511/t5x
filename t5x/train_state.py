@@ -463,12 +463,8 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         )
 
     # ADAFACTOR DEFINITION:
-
-    # ******************************************************************************************
-    # ***************************** TODO: REVERT 0.3 TO LEARNING_RATE **************************
-    # ******************************************************************************************
     adafactor = optax.adafactor(
-        learning_rate=0.3,
+        learning_rate=learning_rate,
         min_dim_size_to_factor=128,
         decay_rate=0.8,
         decay_offset=-1100000,
@@ -571,26 +567,17 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             opt2_interval = states[0]['opt2_interval']
 
             # compute updates
-            # jax.debug.print('***** switching step={x} *****', x=step)
-            # jax.debug.print('ante melodi step={x}', x=states[2]['step'])
-            # jax.debug.print('ante melodi step.shape={x}', x=states[2]['step'].shape)
-            update2, opt2_state = self.opt2.update(gradients, states[2], prompt)
             update1, opt1_state = self.opt1.update(gradients, states[1], prompt)
+            update2, opt2_state = self.opt2.update(gradients, states[2], prompt)
             update = jax.numpy.where(step < switch_step, update1, update2)
-            # jax.debug.print('pre melodi step={x}', x=opt2_state['step'])
-            # jax.debug.print('pre melodi step.shape={x}', x=opt2_state['step'].shape)
 
             # update opt2_state every `opt2_interval` steps
             condition = jax.numpy.logical_or(step >= switch_step, step % opt2_interval == 0)
             opt2_state = jax.lax.cond(condition, lambda: opt2_state, lambda: states[2])
-            # jax.debug.print('post melodi step={x}', x=opt2_state['step'])
-            # jax.debug.print('post melodi step.shape={x}', x=opt2_state['step'].shape)
-            # jax.debug.print('post melodi gradient_memory={x}', x=opt2_state['gradient_memory'][:, 0, 0, 0])
-            # jax.debug.print('')
 
             # create new states
             new_states = [{
-                'step': step+1,
+                'step': step + 1,
                 'switch': switch_step,
                 'opt2_interval': opt2_interval,
             }]
@@ -720,18 +707,43 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
     elif optimizer_name == 'melofactor':
         return ChainedOptimizer((melodi_optimizer, adafactor))
     elif optimizer_name == 'melodi-adafactor-switch50':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
         return SwitchingOptimizer(melodi_optimizer, adafactor, switch_step=50)
     elif optimizer_name == 'adafactor-melodi-switch10':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=10)
     elif optimizer_name == 'adafactor-melodi-switch50':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=50)
     elif optimizer_name == 'adafactor-melodi-switch100':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=100)
     elif optimizer_name == 'adafactor-melodi-switch100-h8':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=100, opt2_interval=8)
+    elif optimizer_name == 'adafactor-melodi-switch0-h8':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=0, opt2_interval=8)
+    elif optimizer_name == 'adafactor-melodi-switch32-h8':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=32, opt2_interval=8)
     elif optimizer_name == 'adafactor-melodi-switch130-h16':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=130, opt2_interval=16)
+    elif optimizer_name == 'adafactor-melodi-switch0-h16':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=0, opt2_interval=16)
+    elif optimizer_name == 'adafactor-melodi-switch16-h16':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=16, opt2_interval=16)
+    elif optimizer_name == 'adafactor-melodi-switch32-h16':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=32, opt2_interval=16)
+    elif optimizer_name == 'adafactor-melodi-switch48-h16':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=48, opt2_interval=16)
     elif optimizer_name == 'adafactor-melodi-switch64-h16':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=64, opt2_interval=16)
     raise ValueError('Unknown optimizer =' + optimizer_name)
 
