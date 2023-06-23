@@ -711,39 +711,87 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
         return SwitchingOptimizer(melodi_optimizer, adafactor, switch_step=50)
     elif optimizer_name == 'adafactor-melodi-switch10':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=learning_rate, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=10)
     elif optimizer_name == 'adafactor-melodi-switch50':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=learning_rate, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=50)
     elif optimizer_name == 'adafactor-melodi-switch100':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=learning_rate, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=100)
     elif optimizer_name == 'adafactor-melodi-switch100-h8':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=learning_rate, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=100, opt2_interval=8)
     elif optimizer_name == 'adafactor-melodi-switch0-h8':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=learning_rate, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=0, opt2_interval=8)
     elif optimizer_name == 'adafactor-melodi-switch32-h8':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=learning_rate, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=32, opt2_interval=8)
     elif optimizer_name == 'adafactor-melodi-switch130-h16':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=learning_rate, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=130, opt2_interval=16)
     elif optimizer_name == 'adafactor-melodi-switch0-h16':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=learning_rate, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=0, opt2_interval=16)
     elif optimizer_name == 'adafactor-melodi-switch16-h16':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=learning_rate, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=16, opt2_interval=16)
     elif optimizer_name == 'adafactor-melodi-switch32-h16':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=learning_rate, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=32, opt2_interval=16)
     elif optimizer_name == 'adafactor-melodi-switch48-h16':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=learning_rate, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=48, opt2_interval=16)
     elif optimizer_name == 'adafactor-melodi-switch64-h16':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=learning_rate, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=64, opt2_interval=16)
     raise ValueError('Unknown optimizer =' + optimizer_name)
 
