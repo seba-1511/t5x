@@ -393,7 +393,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             interleave=True,
             gradients_first=True,
             add_segment_embeddings=False,
-            residual_connection=True,
+            residual_connection='parameters',
             post_processor=models.AppendLinearProjector(
                 base=models.ResidualMLP(
                     residual_connection=False,
