@@ -282,7 +282,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
                 decoder=decoder,
             ),
         )
-    elif 'base-gradients' in melodi_model:
+    elif melodi_model == 'base-gradients':
         transformer = t5_common_layers.decoder(
             num_heads=12,
             head_dim=64,
@@ -293,14 +293,23 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             activations=('gelu', 'linear'),
         )
         transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
-        if 'multitoken' in melodi_model:
-            optimizer = optimizers.GradientOptimizer(
-                model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
-            )
-        else:
-            optimizer = optimizers.GradientOptimizer(
-                model=optimizers.DecoderOnlyOptimizer(model=transformer),
-            )
+        optimizer = optimizers.GradientOptimizer(
+            model=optimizers.DecoderOnlyOptimizer(model=transformer),
+        )
+    elif melodi_model == 'base-gradients-multitoken':
+        transformer = t5_common_layers.decoder(
+            num_heads=12,
+            head_dim=64,
+            mlp_dim=2048,
+            num_layers=12,
+            shared_token_embedder=embedder,
+            dropout_rate=0.0,
+            activations=('gelu', 'linear'),
+        )
+        transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
+        optimizer = optimizers.GradientOptimizer(
+            model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
+        )
     elif melodi_model == 'base-parameters-multitoken':
         transformer = t5_common_layers.decoder(
             num_heads=12,
@@ -337,6 +346,62 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
             interleave=True,
             gradients_first=True,
+        )
+    elif melodi_model == 'base-parameters-gradients-mlp-multitoken':
+        # feed both grads+params, but interleave them with parameters first.
+        # predict updates
+        transformer = t5_common_layers.decoder(
+            num_heads=12,
+            head_dim=64,
+            mlp_dim=2048,
+            num_layers=12,
+            shared_token_embedder=embedder,
+            dropout_rate=0.0,
+            activations=('gelu', 'linear'),
+        )
+        transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
+        optimizer = optimizers.ParameterGradientOptimizer(
+            model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
+            interleave=True,
+            gradients_first=False,
+            add_segment_embeddings=False,
+            residual_connection='None',
+            post_processor=models.AppendLinearProjector(
+                base=models.ResidualMLP(
+                    residual_connection=False,
+                    normalize=True,
+                    num_layers=True,
+                    activation=jax.numpy.tanh,
+                ),
+            )
+        )
+    elif melodi_model == 'base-gradients-parameters-mlp-multitoken':
+        # feed both grads+params, but interleave them with gradients first.
+        # predict new parameters
+        transformer = t5_common_layers.decoder(
+            num_heads=12,
+            head_dim=64,
+            mlp_dim=2048,
+            num_layers=12,
+            shared_token_embedder=embedder,
+            dropout_rate=0.0,
+            activations=('gelu', 'linear'),
+        )
+        transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
+        optimizer = optimizers.ParameterGradientOptimizer(
+            model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
+            interleave=True,
+            gradients_first=True,
+            add_segment_embeddings=False,
+            residual_connection=True,
+            post_processor=models.AppendLinearProjector(
+                base=models.ResidualMLP(
+                    residual_connection=False,
+                    normalize=True,
+                    num_layers=True,
+                    activation=jax.numpy.tanh,
+                ),
+            )
         )
     elif melodi_model == 'large-gradients-projected':
         embedder = models.NoOpEmbedder(
@@ -440,20 +505,35 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
     preprocessor.set_state(checkpoint['preprocessor'])
 
     if 'multitoken' in melodi_model:
-        if 'parameters' in melodi_model:
+        if melodi_model in [
+            'base-gradients-parameters-mlp-multitoken',
+            'base-parameters-gradients-multitoken',
+            'small-parameters-gradients-multitoken',
+        ]:
+            # predict new parameters
             melodi_optimizer = optimizers.MultiTokenParameterOptaxWrapper(
                 optimizer,
                 parameters,
                 memory=melodi_memory,
                 preprocessor=preprocessor,
             )
-        else:
+        elif melodi_model in [
+            'gradients-multitoken',
+            'gradients-multitoken-projected',
+            'base-gradients-multitoken-projected1024',
+            'base-gradients-multitoken',
+            'base-parameters-multitoken',
+            'base-parameters-gradients-mlp-multitoken',
+        ]:
+            # predict updates
             melodi_optimizer = optimizers.MultiTokenOptaxWrapper(
                 optimizer,
                 parameters,
                 memory=melodi_memory,
                 preprocessor=preprocessor,
             )
+        else:
+            raise ValueError('Unknown optax wrapper for: ' + melodi_model)
     else:
         melodi_optimizer = optimizers.PerTokenOptaxWrapper(
             optimizer,
