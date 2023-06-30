@@ -370,7 +370,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
                 base=models.ResidualMLP(
                     residual_connection=False,
                     normalize=True,
-                    num_layers=True,
+                    num_layers=2,
                     activation=jax.numpy.tanh,
                 ),
             )
@@ -398,7 +398,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
                 base=models.ResidualMLP(
                     residual_connection=False,
                     normalize=True,
-                    num_layers=True,
+                    num_layers=2,
                     activation=jax.numpy.tanh,
                 ),
             )
