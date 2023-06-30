@@ -623,6 +623,59 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
     )
 
     @jax.tree_util.register_pytree_node_class
+    class DebugOptimizer:
+
+        def __init__(self, opt1, opt2, opt2_interval=1):
+            self.opt1 = opt1
+            self.opt2 = opt2
+            self.opt2_interval = opt2_interval
+
+        def init(self, prompt):
+            state = [{
+                'step': jax.numpy.zeros((), dtype=jax.numpy.int32),
+                'opt2_interval': jax.numpy.zeros((), dtype=jax.numpy.int32) + self.opt2_interval,
+            }]
+            state.append(self.opt1.init(prompt))
+            state.append(self.opt2.init(prompt))
+            return state
+
+        def update(self, gradients, states, prompt):
+            step = states[0]['step']
+            opt2_interval = states[0]['opt2_interval']
+
+            # compute updates
+            update1, opt1_state = self.opt1.update(gradients, states[1], prompt)
+            update2, opt2_state = self.opt2.update(gradients, states[2], prompt)
+            update = update1
+
+            jax.debug.print(
+                'debug -- step={step}: update norm={norm}',
+                step=step,
+                norm=jax.numpy.linalg.norm(update1 - update2),
+            )
+
+            # update opt2_state every `opt2_interval` steps
+            opt2_state = jax.lax.cond(step % opt2_interval == 0, lambda: opt2_state, lambda: states[2])
+
+            # create new states
+            new_states = [{
+                'step': step + 1,
+                'opt2_interval': opt2_interval,
+            }]
+            new_states.append(opt1_state)
+            new_states.append(opt2_state)
+            return update, new_states
+
+        def tree_flatten(self):
+            contents = []
+            auxiliaries = [self.opt1, self.opt2, self.opt2_interval]
+            return contents, auxiliaries
+
+        @classmethod
+        def tree_unflatten(self, auxiliaries, contents):
+            return ChainedOptimizer(auxiliaries[0], auxiliaries[1], auxiliaries[2])
+
+    @jax.tree_util.register_pytree_node_class
     class SwitchingOptimizer:
 
         def __init__(self, opt1, opt2, switch_step=50, opt2_interval=1):
@@ -667,12 +720,17 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
 
         def tree_flatten(self):
             contents = []
-            auxiliaries = [self.opt1, self.opt2, self.switch_step]
+            auxiliaries = [self.opt1, self.opt2, self.switch_step, self.opt2_interval]
             return contents, auxiliaries
 
         @classmethod
         def tree_unflatten(self, auxiliaries, contents):
-            return ChainedOptimizer(auxiliaries[0], auxiliaries[1], auxiliaries[2])
+            return ChainedOptimizer(
+                opt1=auxiliaries[0],
+                opt2=auxiliaries[1],
+                switch_step=auxiliaries[2],
+                opt2_interval=auxiliaries[3],
+            )
 
     @jax.tree_util.register_pytree_node_class
     class ChainedOptimizer:
@@ -880,6 +938,20 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
             eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=128, opt2_interval=16)
+    elif optimizer_name == 'debug-adafactor-melodi-h4':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=0.3, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
+        return DebugOptimizer(adafactor, melodi_optimizer, opt2_interval=4)
+    elif optimizer_name == 'debug-adafactor-melodi-h16':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=0.3, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
+        return DebugOptimizer(adafactor, melodi_optimizer, opt2_interval=16)
     raise ValueError('Unknown optimizer =' + optimizer_name)
 
 # Has to be on CPU when call from host_callback, else deadlocks
