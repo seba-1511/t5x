@@ -673,7 +673,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
 
         @classmethod
         def tree_unflatten(self, auxiliaries, contents):
-            return ChainedOptimizer(auxiliaries[0], auxiliaries[1], auxiliaries[2])
+            return DebugOptimizer(auxiliaries[0], auxiliaries[1], auxiliaries[2])
 
     @jax.tree_util.register_pytree_node_class
     class SwitchingOptimizer:
@@ -725,7 +725,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
 
         @classmethod
         def tree_unflatten(self, auxiliaries, contents):
-            return ChainedOptimizer(
+            return SwitchingOptimizer(
                 opt1=auxiliaries[0],
                 opt2=auxiliaries[1],
                 switch_step=auxiliaries[2],
@@ -938,6 +938,13 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
             eps=1e-30, factored=True)
         return SwitchingOptimizer(adafactor, melodi_optimizer, switch_step=128, opt2_interval=16)
+    elif optimizer_name == 'debug-adafactor-melodi-h2':
+        melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
+        adafactor = optax.adafactor(
+            learning_rate=0.3, min_dim_size_to_factor=128, decay_rate=0.8, decay_offset=-1100000,
+            multiply_by_parameter_scale=False, clipping_threshold=1.0, momentum=momentum, weight_decay_rate=1e-5,
+            eps=1e-30, factored=True)
+        return DebugOptimizer(adafactor, melodi_optimizer, opt2_interval=2)
     elif optimizer_name == 'debug-adafactor-melodi-h4':
         melodi_optimizer = ChainedOptimizer((melodi_optimizer, heavyball))
         adafactor = optax.adafactor(
