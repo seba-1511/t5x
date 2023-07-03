@@ -644,18 +644,26 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             opt2_interval = states[0]['opt2_interval']
 
             # compute updates
+            jax.debug.print('debug -- step={step}: opt2_interval={interval}', step=step, interval=opt2_interval)
+            jax.debug.print('debug -- step={step}: prompt mse1={norm}', step=step, norm=jax.numpy.mean(prompt**2))
             update1, opt1_state = self.opt1.update(gradients, states[1], prompt)
+            jax.debug.print('debug -- step={step}: prompt mse2={norm}', step=step, norm=jax.numpy.mean(prompt**2))
             update2, opt2_state = self.opt2.update(gradients, states[2], prompt)
-            update = update1
 
-            jax.debug.print(
-                'debug -- step={step}: update norm={norm}',
-                step=step,
-                norm=jax.numpy.linalg.norm(update1 - update2),
-            )
+            jax.debug.print('debug -- step={step}: update1 mse={norm}', step=step, norm=jax.numpy.mean(update1**2))
+            jax.debug.print('debug -- step={step}: update2 mse={norm}', step=step, norm=jax.numpy.mean(update2**2))
 
             # update opt2_state every `opt2_interval` steps
-            opt2_state = jax.lax.cond(step % opt2_interval == 0, lambda: opt2_state, lambda: states[2])
+            condition = step % opt2_interval == 0
+            opt2_state = jax.lax.cond(condition, lambda: opt2_state, lambda: states[2])
+            jax.debug.print('debug -- step={step}: update state={upd}', step=step, upd=condition)
+            jax.debug.print(
+                'debug -- step={step}: update mse={norm}',
+                step=step,
+                norm=optax.l2_loss(update1, update2).mean(),
+                # norm=jax.numpy.mean((update1 - update2)**2),
+            )
+            # jax.debug.breakpoint()
 
             # create new states
             new_states = [{
@@ -664,7 +672,8 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             }]
             new_states.append(opt1_state)
             new_states.append(opt2_state)
-            return update, new_states
+            jax.debug.print('.')
+            return update1, new_states
 
         def tree_flatten(self):
             contents = []
