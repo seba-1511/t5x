@@ -375,6 +375,29 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
                 ),
             )
         )
+    elif melodi_model == 'base-parameters-gradients-linear-multitoken':
+        # feed both grads+params, but interleave them with parameters first.
+        # predict updates
+        transformer = t5_common_layers.decoder(
+            num_heads=12,
+            head_dim=64,
+            mlp_dim=2048,
+            num_layers=12,
+            shared_token_embedder=embedder,
+            dropout_rate=0.0,
+            activations=('gelu', 'linear'),
+        )
+        transformer = jax.tree_util.tree_map(lambda x: jax.device_get(x), transformer)
+        optimizer = optimizers.ParameterGradientOptimizer(
+            model=optimizers.SequenceModelDecoderOnlyOptimizer(model=transformer),
+            interleave=True,
+            gradients_first=False,
+            add_segment_embeddings=False,
+            residual_connection='None',
+            post_processor=models.AppendLinearProjector(
+                base=None,
+            )
+        )
     elif melodi_model == 'base-gradients-parameters-mlp-multitoken':
         # feed both grads+params, but interleave them with gradients first.
         # predict new parameters
@@ -524,6 +547,7 @@ def get_optax_optimizer(optimizer_name=None, melodi_path=None, learning_rate=0.3
             'base-gradients-multitoken',
             'base-parameters-multitoken',
             'base-parameters-gradients-mlp-multitoken',
+            'base-parameters-gradients-linear-multitoken',
         ]:
             # predict updates
             melodi_optimizer = optimizers.MultiTokenOptaxWrapper(
